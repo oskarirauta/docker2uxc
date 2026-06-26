@@ -1,0 +1,25 @@
+{
+  "_comment": "Boilerplate profile. Copy to <name>.json and apply with --profile <name>. Keys starting with _ are stripped. Overlay rules: object keys merge recursively, arrays are APPENDED to the base config (so listed mounts/caps add to, never replace, the defaults). See profiles/README.md.",
+
+  "_comment_caps": "Extra capabilities to ADD on top of the --caps set (e.g. privileged-ish containers). Remove this block if not needed.",
+  "process": {
+    "capabilities": {
+      "bounding":    ["CAP_SYS_ADMIN"],
+      "effective":   ["CAP_SYS_ADMIN"],
+      "permitted":   ["CAP_SYS_ADMIN"],
+      "inheritable": ["CAP_SYS_ADMIN"]
+    }
+  },
+
+  "_comment_mounts": "Bind your host paths and devices here. 'source' is on the HOST, 'destination' inside the container. Use rbind for binds; tmpfs for scratch/shm. EDIT every source path.",
+  "mounts": [
+    { "destination": "/config", "type": "bind", "source": "/srv/CHANGEME/config",
+      "options": ["rbind", "rw"] },
+    { "destination": "/data", "type": "bind", "source": "/srv/CHANGEME/data",
+      "options": ["rbind", "rw"] },
+    { "destination": "/dev/shm", "type": "tmpfs", "source": "tmpfs",
+      "options": ["nosuid", "nodev", "mode=1777", "size=128m"] },
+    { "destination": "/dev/dri", "type": "bind", "source": "/dev/dri",
+      "options": ["rbind"] }
+  ]
+}

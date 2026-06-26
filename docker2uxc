@@ -1,0 +1,654 @@
+#!/bin/sh
+# docker2uxc - convert an OCI/Docker registry image into a uxc OCI runtime bundle
+#
+# Pulls an image straight from a registry (no docker/podman/skopeo needed),
+# flattens its layers into a rootfs (handling AUFS .wh. whiteouts), and emits
+# an OCI runtime config.json suitable for OpenWrt's uxc (procd/ujail).
+#
+# Dependencies: POSIX sh, wget (uclient-fetch or GNU), jq, tar, gzip,
+#               sha256sum.  Optional: xz/unxz, zstd (only for those layer types).
+#
+# SPDX-License-Identifier: MIT
+
+set -eu
+
+VERSION=0.1.0
+SELF=${0##*/}
+SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+PROFILE_DIR="${DOCKER2UXC_PROFILES:-$SCRIPT_DIR/profiles}"
+
+# ------------------------------------------------------------------ defaults --
+OUT=""
+NAME=""
+ARCH=""
+CACHE="${DOCKER2UXC_CACHE:-/tmp/docker2uxc-cache}"
+VERIFY=1
+FORCE=0
+VERBOSE=0
+RW_OVERLAY=0
+CAPS=permissive
+PROFILE=""
+NETWORK=host
+RESOLVCONF=0
+EMIT_NET=0
+NET_BRIDGE=br-lan
+EMIT_KEEPER=0
+
+# --------------------------------------------------------------------- usage --
+usage() {
+	cat <<EOF
+$SELF $VERSION - build a uxc OCI bundle from a registry image
+
+Usage: $SELF [options] <image-ref>
+
+  <image-ref>   e.g. ghcr.io/blakeblackshear/frigate:0.17.1
+                     alpine:3.20            (-> docker.io/library/alpine)
+                     quay.io/prometheus/busybox:latest
+
+Options:
+  -o, --out DIR        output bundle directory (default: ./<name>)
+  -n, --name NAME      container id / hostname (default: repo basename)
+  -a, --arch ARCH      amd64 | arm64 | arm/v7 ...  (default: host arch)
+      --profile NAME   apply profiles/<NAME>.json overlay (e.g. frigate)
+      --network MODE   host | isolated            (default: host)
+                         host     = share the host network namespace (no
+                                    /etc/config/network setup needed)
+                         isolated = own network namespace; you must define an
+                                    interface for it in /etc/config/network
+      --resolv-conf    bind-mount the host /etc/resolv.conf into the container
+      --emit-netconfig write an /etc/config/network veth/infra snippet for the
+                       container into the bundle (NOT applied). Implied by
+                       --network isolated.
+      --net-bridge BR  host bridge to attach the veth to (default: br-lan)
+      --emit-keeper    also write <name>.init: a procd "keeper" service giving
+                       the container a Docker-style auto-restart policy while
+                       keeping it uxc-managed (for apps that restart themselves,
+                       e.g. Frigate's "Save & Restart"). Off by default.
+      --caps SET       permissive | minimal       (default: permissive)
+      --rw-overlay     tune config for a writable overlay (uxc --write-overlay-path)
+      --cache DIR      blob cache directory (default: $CACHE)
+      --no-verify      skip sha256 digest verification of blobs
+  -f, --force          overwrite an existing output directory
+  -v, --verbose        verbose progress
+  -h, --help           this help
+
+Only anonymous/public images are supported in this version.
+EOF
+}
+
+# ------------------------------------------------------------------- logging --
+log()  { printf '%s\n' "$*" >&2; }
+vlog() { [ "$VERBOSE" -eq 1 ] && printf '  %s\n' "$*" >&2 || true; }
+die()  { printf '%s: error: %s\n' "$SELF" "$*" >&2; exit 1; }
+need() { command -v "$1" >/dev/null 2>&1 || die "required tool not found: $1"; }
+
+# --------------------------------------------------------------- arg parsing --
+while [ $# -gt 0 ]; do
+	case $1 in
+		-o|--out)      OUT=$2; shift 2 ;;
+		-n|--name)     NAME=$2; shift 2 ;;
+		-a|--arch)     ARCH=$2; shift 2 ;;
+		--profile)     PROFILE=$2; shift 2 ;;
+		--network)     NETWORK=$2; shift 2 ;;
+		--resolv-conf) RESOLVCONF=1; shift ;;
+		--emit-netconfig) EMIT_NET=1; shift ;;
+		--net-bridge)  NET_BRIDGE=$2; shift 2 ;;
+		--emit-keeper) EMIT_KEEPER=1; shift ;;
+		--caps)        CAPS=$2; shift 2 ;;
+		--rw-overlay)  RW_OVERLAY=1; shift ;;
+		--cache)       CACHE=$2; shift 2 ;;
+		--no-verify)   VERIFY=0; shift ;;
+		-f|--force)    FORCE=1; shift ;;
+		-v|--verbose)  VERBOSE=1; shift ;;
+		-h|--help)     usage; exit 0 ;;
+		--version)     printf '%s\n' "$VERSION"; exit 0 ;;
+		--)            shift; break ;;
+		-*)            die "unknown option: $1 (try --help)" ;;
+		*)             break ;;
+	esac
+done
+
+[ $# -ge 1 ] || { usage >&2; exit 2; }
+REF=$1
+
+need jq; need tar; need gzip; need sha256sum
+command -v wget >/dev/null 2>&1 || need uclient-fetch
+
+case $CAPS in permissive|minimal) ;; *) die "--caps must be permissive or minimal" ;; esac
+case $NETWORK in host|isolated) ;; *) die "--network must be host or isolated" ;; esac
+[ "$NETWORK" = isolated ] && EMIT_NET=1
+
+# --------------------------------------------------------------- host arch ----
+host_arch() {
+	case $(uname -m) in
+		x86_64|amd64)   echo amd64 ;;
+		aarch64|arm64)  echo arm64 ;;
+		armv7l)         echo arm/v7 ;;
+		armv6l)         echo arm/v6 ;;
+		i386|i686)      echo 386 ;;
+		*)              uname -m ;;
+	esac
+}
+[ -n "$ARCH" ] || ARCH=$(host_arch)
+ARCH_BASE=${ARCH%%/*}
+ARCH_VAR=""
+[ "$ARCH" != "$ARCH_BASE" ] && ARCH_VAR=${ARCH#*/}
+
+# ----------------------------------------------------------- reference parse --
+# Split [registry/]repo[:tag|@digest]
+REG="" REPO="" TAG="" DIGEST=""
+rest=$REF
+# digest?
+case $rest in *@*) DIGEST=${rest#*@}; rest=${rest%@*} ;; esac
+# registry = first path component, but only if there's a '/' AND it looks like a
+# host (contains '.' or ':' port, or is localhost). Otherwise it's docker.io.
+case $rest in
+	*/*)
+		first=${rest%%/*}
+		case $first in
+			*.*|*:*|localhost) REG=$first; rest=${rest#*/} ;;
+			*)                 REG=docker.io ;;
+		esac ;;
+	*) REG=docker.io ;;
+esac
+# tag = colon in the last path component (never a registry port, which we removed)
+last=${rest##*/}
+case $last in
+	*:*)
+		TAG=${last##*:}
+		newlast=${last%:*}
+		case $rest in
+			*/*) rest="${rest%/*}/$newlast" ;;
+			*)   rest=$newlast ;;
+		esac ;;
+esac
+REPO=$rest
+[ -n "$TAG" ] || TAG=latest
+# docker.io: official images live under library/
+if [ "$REG" = "docker.io" ]; then
+	case $REPO in */*) ;; *) REPO="library/$REPO" ;; esac
+	APIHOST=registry-1.docker.io
+else
+	APIHOST=$REG
+fi
+
+[ -n "$NAME" ] || NAME=${REPO##*/}
+[ -n "$OUT" ]  || OUT="./$NAME"
+
+REFDESC=${DIGEST:-$TAG}
+log "==> image:    $REG/$REPO ${DIGEST:+@$DIGEST}${DIGEST:+ }${DIGEST:-:$TAG}"
+log "==> arch:     $ARCH"
+log "==> bundle:   $OUT  (name: $NAME)"
+
+# ---------------------------------------------------------------- http layer --
+# wget wrapper: $1=url $2=outfile, remaining args are extra --header values.
+ACCEPT_MANIFEST='application/vnd.oci.image.index.v1+json, application/vnd.docker.distribution.manifest.list.v2+json, application/vnd.oci.image.manifest.v1+json, application/vnd.docker.distribution.manifest.v2+json'
+TOKEN=""
+
+http_get() {
+	_url=$1; _out=$2; shift 2
+	set -- "$@"
+	if [ -n "$TOKEN" ]; then
+		wget -q -O "$_out" --header="Authorization: Bearer $TOKEN" "$@" "$_url"
+	else
+		wget -q -O "$_out" "$@" "$_url"
+	fi
+}
+
+get_token() {
+	# Per-registry anonymous token. Returns 0 and sets TOKEN, or leaves it empty.
+	_scope="repository:$REPO:pull"
+	_tokurl=""
+	case $REG in
+		ghcr.io)        _tokurl="https://ghcr.io/token?scope=$_scope" ;;
+		docker.io)      _tokurl="https://auth.docker.io/token?service=registry.docker.io&scope=$_scope" ;;
+		quay.io)        _tokurl="https://quay.io/v2/auth?service=quay.io&scope=$_scope" ;;
+		*)              _tokurl="https://$REG/token?scope=$_scope" ;;
+	esac
+	_tf=$(mktemp)
+	if wget -q -O "$_tf" "$_tokurl" 2>/dev/null; then
+		TOKEN=$(jq -r '.token // .access_token // empty' "$_tf" 2>/dev/null || true)
+	fi
+	rm -f "$_tf"
+	[ -n "$TOKEN" ] && vlog "got anonymous token (${#TOKEN} chars)" || vlog "no token (anonymous registry?)"
+}
+
+# -------------------------------------------------------------- manifest fetch
+WORK=$(mktemp -d)
+cleanup() { rm -rf "$WORK"; }
+trap cleanup EXIT INT TERM
+
+get_token
+
+log "==> resolving manifest"
+http_get "https://$APIHOST/v2/$REPO/manifests/$REFDESC" "$WORK/idx.json" \
+	--header="Accept: $ACCEPT_MANIFEST" \
+	|| die "failed to fetch manifest (private image, or wrong ref?)"
+
+MTYPE=$(jq -r '.mediaType // ""' "$WORK/idx.json")
+case $MTYPE in
+	*image.index*|*manifest.list*)
+		vlog "multi-arch index; selecting linux/$ARCH"
+		SEL=$(jq -r --arg a "$ARCH_BASE" --arg v "$ARCH_VAR" '
+			.manifests[]
+			| select(.platform.os=="linux"
+			         and .platform.architecture==$a
+			         and ((.platform.variant // "")==$v))
+			| .digest' "$WORK/idx.json" | head -n1)
+		[ -n "$SEL" ] || {
+			log "available platforms:"
+			jq -r '.manifests[] | "    \(.platform.os)/\(.platform.architecture)\(.platform.variant // "")"' "$WORK/idx.json" >&2
+			die "no manifest for linux/$ARCH"
+		}
+		vlog "selected $SEL"
+		http_get "https://$APIHOST/v2/$REPO/manifests/$SEL" "$WORK/manifest.json" \
+			--header="Accept: $ACCEPT_MANIFEST" \
+			|| die "failed to fetch per-arch manifest"
+		;;
+	*)
+		cp "$WORK/idx.json" "$WORK/manifest.json"
+		;;
+esac
+
+CONFIG_DIGEST=$(jq -r '.config.digest' "$WORK/manifest.json")
+[ "$CONFIG_DIGEST" != null ] || die "manifest has no config (unexpected media type: $MTYPE)"
+NLAYERS=$(jq -r '.layers | length' "$WORK/manifest.json")
+log "==> $NLAYERS layer(s), config $CONFIG_DIGEST"
+
+# ------------------------------------------------------------------ blob pull --
+mkdir -p "$CACHE"
+
+blob_path() { echo "$CACHE/${1#sha256:}"; }
+
+fetch_blob() {
+	# $1 = digest ; downloads into cache (idempotent), verifies sha256
+	_d=$1; _p=$(blob_path "$_d")
+	if [ -s "$_p" ]; then
+		vlog "cache hit ${_d#sha256:}"
+	else
+		vlog "fetch ${_d#sha256:}"
+		_try=0
+		while :; do
+			if http_get "https://$APIHOST/v2/$REPO/blobs/$_d" "$_p.part"; then
+				break
+			fi
+			_try=$((_try+1))
+			[ "$_try" -ge 3 ] && { rm -f "$_p.part"; die "blob download failed: $_d"; }
+			vlog "retry $_try (refreshing token)"
+			get_token
+		done
+		mv "$_p.part" "$_p"
+	fi
+	if [ "$VERIFY" -eq 1 ]; then
+		_sum=$(sha256sum "$_p" | cut -d' ' -f1)
+		[ "$_sum" = "${_d#sha256:}" ] || die "digest mismatch for $_d (got $_sum)"
+	fi
+	echo "$_p"
+}
+
+log "==> downloading config"
+CONFIG_BLOB=$(fetch_blob "$CONFIG_DIGEST")
+
+log "==> downloading $NLAYERS layer(s)"
+i=0
+LAYERS=""
+while [ "$i" -lt "$NLAYERS" ]; do
+	d=$(jq -r ".layers[$i].digest" "$WORK/manifest.json")
+	mt=$(jq -r ".layers[$i].mediaType" "$WORK/manifest.json")
+	sz=$(jq -r ".layers[$i].size" "$WORK/manifest.json")
+	log "    [$((i+1))/$NLAYERS] ${d#sha256:}  ($((sz/1024/1024)) MB, ${mt##*.})"
+	bp=$(fetch_blob "$d")
+	LAYERS="$LAYERS$bp	$mt
+"
+	i=$((i+1))
+done
+
+# ------------------------------------------------------------------- flatten ---
+ROOTFS="$WORK/rootfs"
+mkdir -p "$ROOTFS"
+
+decompress_to() {
+	# $1 = blob path, $2 = mediaType ; emits a tar stream on stdout
+	case $2 in
+		*tar+gzip|*tar.gzip|*+gzip) gzip -dc "$1" ;;
+		*tar+zstd|*+zstd)
+			command -v zstd >/dev/null 2>&1 || die "layer is zstd; install zstd (opkg install zstd)"
+			zstd -dc "$1" ;;
+		*tar+xz|*+xz)
+			if command -v xz >/dev/null 2>&1; then xz -dc "$1"
+			else unxz -c "$1"; fi ;;
+		*tar) cat "$1" ;;
+		*) die "unsupported layer media type: $2" ;;
+	esac
+}
+
+apply_whiteouts() {
+	# $1 = extracted layer dir, $2 = target rootfs
+	_ld=$1; _rf=$2
+	# opaque dirs first, then file/dir whiteouts
+	find "$_ld" -name '.wh..wh..opq' 2>/dev/null | while IFS= read -r m; do
+		_rel=${m#"$_ld"/}; _dir=${_rel%/.wh..wh..opq}
+		[ "$_dir" = "$_rel" ] && _dir=""   # opq at root
+		vlog "opaque $_dir"
+		[ -d "$_rf/$_dir" ] && find "$_rf/$_dir" -mindepth 1 -maxdepth 1 -exec rm -rf {} + 2>/dev/null || true
+		rm -f "$m"
+	done
+	find "$_ld" -name '.wh.*' ! -name '.wh..wh..opq' 2>/dev/null | while IFS= read -r m; do
+		_rel=${m#"$_ld"/}; _bn=${_rel##*/}; _dir=${_rel%/*}
+		[ "$_dir" = "$_rel" ] && _dir=""
+		_target=${_bn#.wh.}
+		vlog "whiteout ${_dir:+$_dir/}$_target"
+		rm -rf "$_rf/${_dir:+$_dir/}$_target"
+		rm -f "$m"
+	done
+}
+
+log "==> flattening into rootfs"
+printf '%s' "$LAYERS" | while IFS='	' read -r bp mt; do
+	[ -n "$bp" ] || continue
+	if decompress_to "$bp" "$mt" | tar -t 2>/dev/null | grep -q '\(^\|/\)\.wh\.'; then
+		# safe path: extract to temp, apply whiteouts, merge
+		ldir="$WORK/layer.$$"
+		rm -rf "$ldir"; mkdir -p "$ldir"
+		decompress_to "$bp" "$mt" | tar -x -p -C "$ldir" 2>/dev/null || true
+		apply_whiteouts "$ldir" "$ROOTFS"
+		cp -a "$ldir/." "$ROOTFS/" 2>/dev/null || true
+		rm -rf "$ldir"
+	else
+		# fast path: no whiteouts, extract straight in
+		decompress_to "$bp" "$mt" | tar -x -p -C "$ROOTFS" 2>/dev/null || true
+	fi
+done
+
+# --------------------------------------------------- image config -> runtime ---
+log "==> generating uxc config.json"
+
+# Resolve User -> uid:gid (numeric, or name looked up in the rootfs).
+USER_STR=$(jq -r '.config.User // "" | tostring' "$CONFIG_BLOB")
+UID_N=0; GID_N=0
+if [ -n "$USER_STR" ]; then
+	u=${USER_STR%%:*}; g=""
+	case $USER_STR in *:*) g=${USER_STR#*:} ;; esac
+	case $u in
+		''|*[!0-9]*)
+			if [ -f "$ROOTFS/etc/passwd" ]; then
+				line=$(grep -E "^$u:" "$ROOTFS/etc/passwd" 2>/dev/null | head -n1 || true)
+				[ -n "$line" ] && { UID_N=$(echo "$line" | cut -d: -f3); [ -z "$g" ] && GID_N=$(echo "$line" | cut -d: -f4); }
+			fi ;;
+		*) UID_N=$u ;;
+	esac
+	case $g in
+		'') : ;;
+		*[!0-9]*)
+			if [ -f "$ROOTFS/etc/group" ]; then
+				line=$(grep -E "^$g:" "$ROOTFS/etc/group" 2>/dev/null | head -n1 || true)
+				[ -n "$line" ] && GID_N=$(echo "$line" | cut -d: -f3)
+			fi ;;
+		*) GID_N=$g ;;
+	esac
+fi
+[ -n "$UID_N" ] || UID_N=0
+[ -n "$GID_N" ] || GID_N=0
+
+# Capability sets.
+CAPS_PERMISSIVE='["CAP_CHOWN","CAP_DAC_OVERRIDE","CAP_DAC_READ_SEARCH","CAP_FOWNER","CAP_FSETID","CAP_KILL","CAP_SETGID","CAP_SETUID","CAP_SETPCAP","CAP_NET_BIND_SERVICE","CAP_NET_RAW","CAP_NET_ADMIN","CAP_SYS_CHROOT","CAP_MKNOD","CAP_AUDIT_WRITE","CAP_SETFCAP","CAP_IPC_LOCK","CAP_SYS_PTRACE","CAP_SYS_NICE","CAP_SYS_RESOURCE"]'
+CAPS_MINIMAL='["CAP_CHOWN","CAP_DAC_OVERRIDE","CAP_FOWNER","CAP_SETGID","CAP_SETUID","CAP_NET_BIND_SERVICE","CAP_KILL"]'
+case $CAPS in permissive) CAPSET=$CAPS_PERMISSIVE ;; minimal) CAPSET=$CAPS_MINIMAL ;; esac
+
+RO_ROOT=false
+[ "$RW_OVERLAY" -eq 1 ] && RO_ROOT=true   # overlay supplies the writable upper layer
+
+# Network namespace: isolated => own netns (needs a host /etc/config/network
+# interface); host => share the host network (no provisioning required).
+if [ "$NETWORK" = isolated ]; then NS_NET='{"type":"network"},'; else NS_NET=''; fi
+NS_JSON="[{\"type\":\"pid\"},${NS_NET}{\"type\":\"ipc\"},{\"type\":\"uts\"},{\"type\":\"cgroup\"},{\"type\":\"mount\"}]"
+
+# resolv.conf is opt-in: uxc/procd manages container DNS itself, and a stray
+# bind can clash with that. Add it only when the user asks.
+if [ "$RESOLVCONF" -eq 1 ]; then
+	RESOLV_MOUNT='[{"destination":"/etc/resolv.conf","type":"bind","source":"/etc/resolv.conf","options":["rbind","ro"]}]'
+else
+	RESOLV_MOUNT='[]'
+fi
+
+jq -n \
+	--slurpfile img "$CONFIG_BLOB" \
+	--arg name "$NAME" \
+	--argjson uid "$UID_N" \
+	--argjson gid "$GID_N" \
+	--argjson caps "$CAPSET" \
+	--argjson roroot "$RO_ROOT" \
+	--argjson ns "$NS_JSON" \
+	--argjson resolv "$RESOLV_MOUNT" \
+	'
+	($img[0].config // {}) as $c
+	| (($c.Entrypoint // []) + ($c.Cmd // [])) as $args
+	| (if ($args|length)==0 then ["/bin/sh"] else $args end) as $args
+	| ($c.Env // []) as $env
+	| (if any($env[]; startswith("PATH=")) then $env
+	   else $env + ["PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"] end) as $env
+	| {
+	  ociVersion: "1.0.2",
+	  hostname: $name,
+	  process: {
+	    terminal: false,
+	    user: { uid: $uid, gid: $gid },
+	    cwd: (if (($c.WorkingDir // "")|length)>0 then $c.WorkingDir else "/" end),
+	    args: $args,
+	    env: $env,
+	    capabilities: {
+	      bounding: $caps, effective: $caps, inheritable: $caps,
+	      permitted: $caps, ambient: []
+	    },
+	    rlimits: [ { type: "RLIMIT_NOFILE", hard: 1048576, soft: 1048576 } ],
+	    noNewPrivileges: false
+	  },
+	  root: { path: "rootfs", readonly: $roroot },
+	  mounts: [
+	    { destination: "/proc", type: "proc", source: "proc" },
+	    { destination: "/sys",  type: "sysfs", source: "sysfs",
+	      options: ["nosuid","noexec","nodev","ro"] },
+	    { destination: "/tmp",  type: "tmpfs", source: "tmpfs",
+	      options: ["nosuid","nodev","mode=1777"] },
+	    { destination: "/run",  type: "tmpfs", source: "tmpfs",
+	      options: ["nosuid","nodev","mode=0755"] }
+	  ] + $resolv,
+	  linux: {
+	    namespaces: $ns
+	  }
+	}' > "$WORK/config.json" || die "failed to build config.json"
+
+# --------------------------------------------------------------- apply profile
+deepmerge_prog='
+def deepmerge($a;$b):
+  if ($a|type)=="object" and ($b|type)=="object" then
+    reduce ($b|keys_unsorted[]) as $k ($a;
+      .[$k] = (if (.[$k]==null) then $b[$k] else deepmerge(.[$k];$b[$k]) end))
+  elif ($a|type)=="array" and ($b|type)=="array" then ($a+$b)
+  else $b end;
+deepmerge($base[0];$ovl[0])
+| walk(if type=="object" then with_entries(select(.key|startswith("_")|not)) else . end)'
+
+if [ -n "$PROFILE" ]; then
+	PF="$PROFILE_DIR/$PROFILE.json"
+	[ -f "$PF" ] || die "profile not found: $PF"
+	log "==> applying profile: $PROFILE"
+	jq -n --slurpfile base "$WORK/config.json" --slurpfile ovl "$PF" "$deepmerge_prog" \
+		> "$WORK/config.merged.json" || die "profile merge failed"
+	mv "$WORK/config.merged.json" "$WORK/config.json"
+fi
+
+# ------------------------------------------------------- network snippet (opt) -
+# Emit, but never apply, an /etc/config/network stanza for an isolated container.
+# Model: a veth pair; host end bridged, peer handed to the container netns and
+# managed by uxc/netifd via proto 'infra'. Based on the OpenWrt container-veth
+# pattern. Review and edit before applying. See docs/uxc-networking.md.
+write_netconfig() {
+	_host="vh-$NAME"; _peer="${NAME}0"
+	# keep interface/device names within Linux's 15-char limit
+	_host=$(printf '%.15s' "$_host"); _peer=$(printf '%.15s' "$_peer")
+	cat > "$OUT/network.uci" <<EOF
+# docker2uxc: /etc/config/network snippet for isolated container '$NAME'.
+# NOT applied automatically - review, edit the bridge/addressing, then apply with:
+#     cat network.uci >> /etc/config/network && /etc/init.d/network reload
+# See docs/uxc-networking.md for the full explanation.
+
+# 1) veth pair: host side '$_host', container side '$_peer'
+config device
+	option type 'veth'
+	option name '$_host'
+	option peer_name '$_peer'
+
+# 2) attach the host side to a bridge (default '$NET_BRIDGE' - change if needed)
+config device
+	option name '$NET_BRIDGE'
+	list ports '$_host'
+
+# 3) container-side interface, managed inside the netns by uxc/netifd.
+#    proto 'infra' lets uxc move '$_peer' into the container and wire DNS.
+config interface '$NAME'
+	option proto 'infra'
+	option device '$_peer'
+EOF
+	log "    network: wrote $OUT/network.uci (isolated mode - review before applying)"
+}
+
+# ----------------------------------------------------- uxc keeper service -----
+# uxc has no restart policy (Docker's "restart: unless-stopped"): 'uxc enable'
+# only starts on boot, it does not respawn a container that exits. Apps like
+# Frigate exit on purpose to reload config (web UI "Save & Restart") and expect
+# the runtime to bring them back. This emits a small procd "keeper" service that
+# does exactly that WHILE keeping the container managed by uxc (still shows in
+# 'uxc list', controllable with uxc state/kill/attach) - it just re-runs
+# 'uxc start' whenever the container is not running.
+write_initd() {
+	_bundle=$(cd "$OUT" && pwd)
+	{
+		echo '#!/bin/sh /etc/rc.common'
+		echo "# uxc keeper for the docker2uxc bundle '$NAME' - gives uxc a Docker-style"
+		echo "# auto-restart policy without bypassing uxc (stays in 'uxc list')."
+		echo "# Install: cp $NAME.init /etc/init.d/$NAME-keeper && chmod +x /etc/init.d/$NAME-keeper"
+		echo "#          /etc/init.d/$NAME-keeper enable && /etc/init.d/$NAME-keeper start"
+		echo "# Stop with: /etc/init.d/$NAME-keeper stop  (plain 'uxc kill' would just be"
+		echo "# restarted by the keeper, like Docker's restart: always)."
+		echo 'USE_PROCD=1'
+		echo 'START=95'
+		echo 'STOP=10'
+		echo "NAME=$NAME"
+		echo "BUNDLE=$_bundle"
+		cat <<'EOF'
+
+start_service() {
+	procd_open_instance "${NAME}-keeper"
+	procd_set_param command /bin/sh -c "
+		uxc create $NAME --bundle $BUNDLE 2>/dev/null
+		while true; do
+			st=\$(uxc state $NAME 2>/dev/null | jsonfilter -e '@.status' 2>/dev/null)
+			if [ \"\$st\" != running ]; then
+				# Recover: re-create (no --bundle - the path is stored, and
+				# passing it again errors 'File exists'), then poll 'uxc start'
+				# until it takes. 'uxc create' returns before the container is
+				# start-ready, and how long that takes scales with image size,
+				# so poll instead of a fixed sleep.
+				uxc create $NAME 2>/dev/null
+				n=0
+				until uxc start $NAME 2>/dev/null || [ \$n -ge 60 ]; do n=\$((n+1)); sleep 1; done
+			fi
+			sleep 5
+		done
+	"
+	procd_set_param respawn
+	procd_close_instance
+}
+
+stop_service() {
+	uxc kill "$NAME" 2>/dev/null
+}
+EOF
+	} > "$OUT/$NAME.init"
+	log "    init: wrote $OUT/$NAME.init (uxc keeper - auto-restart, stays uxc-managed)"
+}
+
+# ----------------------------------------------------------------- notes file --
+write_notes() {
+	{
+		echo "# $NAME - generated by docker2uxc $VERSION"
+		echo
+		echo "Source image : $REG/$REPO:$TAG ($ARCH)"
+		echo "Config digest: $CONFIG_DIGEST"
+		echo
+		echo "## Entrypoint / Cmd"
+		jq -r '.process.args | "    " + (map(@sh) | join(" "))' "$WORK/config.json"
+		echo
+		echo "## Network: $NETWORK"
+		if [ "$NETWORK" = host ]; then
+			echo "    Shares the host network namespace - no /etc/config/network setup needed."
+		else
+			echo "    Own network namespace. Apply the generated network.uci to"
+			echo "    /etc/config/network (review it first) or DNS/connectivity will fail:"
+			echo "        cat network.uci >> /etc/config/network && /etc/init.d/network reload"
+		fi
+		echo
+		echo "## Exposed ports (from image - uxc does no port mapping)"
+		jq -r '(.config.ExposedPorts // {}) | keys[] | "    " + .' "$CONFIG_BLOB" 2>/dev/null || true
+		echo
+		echo "## Volumes declared by image (MOUNT THESE BY HAND in config.json)"
+		jq -r '(.config.Volumes // {}) | keys[] | "    " + .' "$CONFIG_BLOB" 2>/dev/null || true
+		echo
+		echo "Add bind mounts to config.json \"mounts\" like:"
+		echo '    { "destination": "/data", "type": "bind",'
+		echo '      "source": "/srv/'"$NAME"'/data", "options": ["rbind","rw"] }'
+		echo
+		echo "## Install (option A: uxc)"
+		echo "    uxc create $NAME --bundle $(cd "$OUT" 2>/dev/null && pwd || echo "$OUT")${RW_OVERLAY:+ }$([ "$RW_OVERLAY" -eq 1 ] && echo "--write-overlay-path <overlay-dir>")"
+		echo "    uxc start  $NAME"
+		echo "    uxc enable $NAME      # autostart on boot"
+		echo "    NOTE: 'uxc start' may print a cosmetic 'No such file or directory';"
+		echo "    the container boots asynchronously - check 'uxc state $NAME'."
+		echo
+		if [ "$EMIT_KEEPER" -eq 1 ]; then
+		echo "## Install (option B: uxc keeper - auto-restart, stays uxc-managed)"
+		echo "    Use this if the app restarts itself (e.g. Frigate UI 'Save & Restart');"
+		echo "    uxc has no respawn policy, so the plain uxc method won't come back."
+		echo "    The keeper still leaves the container in 'uxc list' / uxc state|kill|attach."
+		echo "    cp $NAME.init /etc/init.d/$NAME-keeper && chmod +x /etc/init.d/$NAME-keeper"
+		echo "    /etc/init.d/$NAME-keeper enable && /etc/init.d/$NAME-keeper start"
+		fi
+	} > "$OUT/README.notes"
+}
+
+# -------------------------------------------------------------- write output --
+if [ -e "$OUT" ]; then
+	[ "$FORCE" -eq 1 ] || die "output exists: $OUT (use --force)"
+	rm -rf "$OUT"
+fi
+mkdir -p "$OUT"
+mv "$ROOTFS" "$OUT/rootfs"
+cp "$WORK/config.json"   "$OUT/config.json"
+cp "$WORK/manifest.json" "$OUT/manifest.json"
+cp "$CONFIG_BLOB"        "$OUT/image-config.json"
+[ "$EMIT_NET" -eq 1 ] && write_netconfig
+[ "$EMIT_KEEPER" -eq 1 ] && write_initd
+write_notes
+
+# Warn about bind sources that don't exist on the host: ujail stat()s every bind
+# source and fails the WHOLE container if even one is missing (e.g. /etc/localtime
+# is usually absent on OpenWrt). Warn, don't fail - the user may create them later.
+MISSING=$(jq -r '.mounts[] | select(.type=="bind") | .source' "$OUT/config.json" \
+	| while IFS= read -r s; do [ -e "$s" ] || printf '%s ' "$s"; done)
+if [ -n "$MISSING" ]; then
+	log ""
+	log "WARNING: these bind mount sources do not exist on the host yet:"
+	for s in $MISSING; do log "    $s"; done
+	log "  Create them (mkdir -p ...) before 'uxc start', or ujail will refuse to"
+	log "  build the container ('jail: mount_all() failed')."
+fi
+
+log ""
+log "==> done: $OUT"
+log "    rootfs: $(du -sh "$OUT/rootfs" 2>/dev/null | cut -f1)"
+log ""
+log "Next:"
+log "    uxc create $NAME --bundle $(cd "$OUT" && pwd)"
+log "    uxc start  $NAME"
+log "    (see $OUT/README.notes for ports, volumes and device mounts to add)"

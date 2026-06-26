@@ -1,0 +1,9 @@
+# build/runtime artifacts
+.cache/
+.tmp/
+out-*/
+*.log
+
+# generated bundles
+/frigate/
+/alpine/

@@ -1,0 +1,24 @@
+{
+  "_comment": "Frigate NVR overlay. EDIT the bind 'source' paths to match your host. See profiles/README.md. shm 'size' scales with camera count/resolution.",
+  "_comment_tz": "Timezone via env (Frigate honors TZ). Bind-mounting /etc/localtime is avoided because OpenWrt usually has no such file, and a missing bind source makes ujail fail the whole container. Set TZ to your zone.",
+  "process": {
+    "env": ["TZ=UTC"],
+    "capabilities": {
+      "bounding":    ["CAP_SYS_ADMIN"],
+      "effective":   ["CAP_SYS_ADMIN"],
+      "permitted":   ["CAP_SYS_ADMIN"],
+      "inheritable": ["CAP_SYS_ADMIN"]
+    }
+  },
+  "_comment_mounts": "EDIT every bind 'source' to your host paths. ALL sources must exist on the host or ujail fails to start the container. /dev/dri is for VAAPI; remove it if the host has no GPU.",
+  "mounts": [
+    { "destination": "/dev/shm", "type": "tmpfs", "source": "tmpfs",
+      "options": ["nosuid", "nodev", "mode=1777", "size=256m"] },
+    { "destination": "/config", "type": "bind", "source": "/srv/frigate/config",
+      "options": ["rbind", "rw"] },
+    { "destination": "/media", "type": "bind", "source": "/srv/frigate/media",
+      "options": ["rbind", "rw"] },
+    { "destination": "/dev/dri", "type": "bind", "source": "/dev/dri",
+      "options": ["rbind"] }
+  ]
+}
