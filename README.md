@@ -50,6 +50,7 @@ Options:
       --network MODE   host | isolated               (default: host)
       --resolv-conf    bind-mount the host /etc/resolv.conf
       --caps SET       permissive | minimal          (default: permissive)
+      --no-accounting  don't add the linux.resources cgroup-accounting block
       --rw-overlay     tune config for a writable overlay
       --cache DIR      blob cache dir (default: /tmp/docker2uxc-cache)
       --no-verify      skip sha256 digest verification
@@ -133,6 +134,15 @@ keeps that and provides the writable `/run` and `/tmp` it expects. Size `/dev/sh
 to your cameras (the profile defaults to 256 MB). For hardware the converter
 cannot know about — a Coral TPU (`/dev/apex_0` PCIe or `/dev/bus/usb` USB) or a
 specific VAAPI device — add the bind mount in `config.json` or your profile.
+
+## Resource accounting
+
+By default the generated `config.json` includes a `linux.resources` block
+(`memory` unlimited, `pids` set to the host's `pid_max`). It imposes no real
+limit; its purpose is to make ujail enable the memory and pids cgroup
+controllers, so per-container memory/pids usage becomes readable under
+`/sys/fs/cgroup/containers/<name>/` (e.g. by a monitor like `uxcd`). Without it
+only CPU usage is available. Pass `--no-accounting` to omit the block.
 
 ## Limitations
 
