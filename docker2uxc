@@ -34,11 +34,15 @@ EMIT_NET=0
 NET_BRIDGE=br-lan
 EMIT_KEEPER=0
 ACCOUNTING=1
+REGISTER=1
+AUTOSTART=0
+INFRA=""
+UXC_DIR="${DOCKER2UXC_UXCDIR:-/etc/uxc}"
 
 # --------------------------------------------------------------------- usage --
 usage() {
 	cat <<EOF
-$SELF $VERSION - build a uxc OCI bundle from a registry image
+$SELF $VERSION - build a uxc OCI bundle from a registry image and register it with uxcd
 
 Usage: $SELF [options] <image-ref>
 
@@ -71,6 +75,9 @@ Options:
                        become available (e.g. for uxcd).
       --caps SET       permissive | minimal       (default: permissive)
       --rw-overlay     tune config for a writable overlay (uxc --write-overlay-path)
+      --autostart      register the container to start on boot
+      --infra NAME     register the container as a member of shared netns NAME
+      --no-register    only build the bundle; do not write $UXC_DIR/<name>.json
       --cache DIR      blob cache directory (default: $CACHE)
       --no-verify      skip sha256 digest verification of blobs
   -f, --force          overwrite an existing output directory
@@ -102,6 +109,9 @@ while [ $# -gt 0 ]; do
 		--no-accounting) ACCOUNTING=0; shift ;;
 		--caps)        CAPS=$2; shift 2 ;;
 		--rw-overlay)  RW_OVERLAY=1; shift ;;
+		--autostart)   AUTOSTART=1; shift ;;
+		--infra)       INFRA=$2; shift 2 ;;
+		--no-register) REGISTER=0; shift ;;
 		--cache)       CACHE=$2; shift 2 ;;
 		--no-verify)   VERIFY=0; shift ;;
 		-f|--force)    FORCE=1; shift ;;
@@ -661,11 +671,38 @@ if [ -n "$MISSING" ]; then
 	log "  build the container ('jail: mount_all() failed')."
 fi
 
+ABS_OUT=$(cd "$OUT" && pwd)
+
+# ---------------------------------------------------------------- register --
+# Write the uxcd registry entry $UXC_DIR/<name>.json directly (so it works even
+# when uxcd is not running; uxcd reads the registry on demand). Per-container
+# runtime overrides (volumes/devices/env/resources) are added here later by the
+# user and survive image re-pulls. The bundle itself stays the image's config.
+if [ "$REGISTER" -eq 1 ]; then
+	mkdir -p "$UXC_DIR"
+	{
+		printf '{\n'
+		printf '\t"name": %s,\n' "$(printf '%s' "$NAME" | jq -R .)"
+		[ "$AUTOSTART" -eq 1 ] && printf '\t"autostart": true,\n'
+		[ -n "$INFRA" ] && printf '\t"infra": %s,\n' "$(printf '%s' "$INFRA" | jq -R .)"
+		printf '\t"path": %s\n' "$(printf '%s' "$ABS_OUT" | jq -R .)"
+		printf '}\n'
+	} > "$UXC_DIR/$NAME.json"
+	log ""
+	log "==> registered: $UXC_DIR/$NAME.json"
+fi
+
 log ""
 log "==> done: $OUT"
 log "    rootfs: $(du -sh "$OUT/rootfs" 2>/dev/null | cut -f1)"
 log ""
-log "Next:"
-log "    uxc create $NAME --bundle $(cd "$OUT" && pwd)"
-log "    uxc start  $NAME"
-log "    (see $OUT/README.notes for ports, volumes and device mounts to add)"
+if [ "$REGISTER" -eq 1 ]; then
+	log "Next:"
+	log "    uxc start $NAME"
+	log "    (add volumes/devices/env to $UXC_DIR/$NAME.json; see $OUT/README.notes)"
+else
+	log "Next:"
+	log "    uxc create $NAME --bundle $ABS_OUT"
+	log "    uxc start  $NAME"
+	log "    (see $OUT/README.notes for ports, volumes and device mounts to add)"
+fi
