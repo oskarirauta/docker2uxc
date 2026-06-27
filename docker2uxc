@@ -645,9 +645,12 @@ write_notes() {
 }
 
 # -------------------------------------------------------------- write output --
+# On overwrite keep the previous bundle as <out>.prev (one generation) so the
+# container can be rolled back after an update (uxc rollback).
 if [ -e "$OUT" ]; then
 	[ "$FORCE" -eq 1 ] || die "output exists: $OUT (use --force)"
-	rm -rf "$OUT"
+	rm -rf "$OUT.prev"
+	mv "$OUT" "$OUT.prev"
 fi
 mkdir -p "$OUT"
 mv "$ROOTFS" "$OUT/rootfs"
