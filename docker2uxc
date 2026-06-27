@@ -15,7 +15,15 @@ set -eu
 VERSION=0.1.0
 SELF=${0##*/}
 SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
-PROFILE_DIR="${DOCKER2UXC_PROFILES:-$SCRIPT_DIR/profiles}"
+# profiles: $DOCKER2UXC_PROFILES override, else the in-tree dir (dev), else the
+# packaged system path.
+if [ -n "${DOCKER2UXC_PROFILES:-}" ]; then
+	PROFILE_DIR=$DOCKER2UXC_PROFILES
+elif [ -d "$SCRIPT_DIR/profiles" ]; then
+	PROFILE_DIR="$SCRIPT_DIR/profiles"
+else
+	PROFILE_DIR=/usr/share/docker2uxc/profiles
+fi
 
 # ------------------------------------------------------------------ defaults --
 OUT=""
