@@ -38,6 +38,8 @@ REGISTER=1
 AUTOSTART=0
 INFRA=""
 UXC_DIR="${DOCKER2UXC_UXCDIR:-/etc/uxc}"
+DOCKERFILE=""
+CONTEXT=""
 
 # --------------------------------------------------------------------- usage --
 usage() {
@@ -78,6 +80,10 @@ Options:
       --autostart      register the container to start on boot
       --infra NAME     register the container as a member of shared netns NAME
       --no-register    only build the bundle; do not write $UXC_DIR/<name>.json
+      --dockerfile F   build from a Dockerfile instead of pulling a ready image
+                       (FROM gives the base; RUN/COPY/ADD/ENV/WORKDIR/USER/CMD/
+                       ENTRYPOINT supported; single-stage, host architecture)
+      --context DIR    build context for COPY/ADD (default: the Dockerfile's dir)
       --cache DIR      blob cache directory (default: $CACHE)
       --no-verify      skip sha256 digest verification of blobs
   -f, --force          overwrite an existing output directory
@@ -112,6 +118,8 @@ while [ $# -gt 0 ]; do
 		--autostart)   AUTOSTART=1; shift ;;
 		--infra)       INFRA=$2; shift 2 ;;
 		--no-register) REGISTER=0; shift ;;
+		--dockerfile)  DOCKERFILE=$2; shift 2 ;;
+		--context)     CONTEXT=$2; shift 2 ;;
 		--cache)       CACHE=$2; shift 2 ;;
 		--no-verify)   VERIFY=0; shift ;;
 		-f|--force)    FORCE=1; shift ;;
@@ -124,8 +132,17 @@ while [ $# -gt 0 ]; do
 	esac
 done
 
-[ $# -ge 1 ] || { usage >&2; exit 2; }
-REF=$1
+# In Dockerfile mode the base image comes from FROM, not a positional argument.
+if [ -n "$DOCKERFILE" ]; then
+	[ -f "$DOCKERFILE" ] || die "dockerfile not found: $DOCKERFILE"
+	[ -n "$CONTEXT" ] || CONTEXT=$(dirname -- "$DOCKERFILE")
+	REF=$(awk 'toupper($1)=="FROM"{for(i=2;i<=NF;i++) if($i !~ /^--/){print $i; exit}}' "$DOCKERFILE")
+	[ -n "$REF" ] || die "no FROM instruction in $DOCKERFILE"
+	case $REF in *" AS "*|*" as "*) die "multi-stage builds are not supported (single FROM only)" ;; esac
+else
+	[ $# -ge 1 ] || { usage >&2; exit 2; }
+	REF=$1
+fi
 
 need jq; need tar; need gzip; need sha256sum
 command -v wget >/dev/null 2>&1 || need uclient-fetch
@@ -188,7 +205,11 @@ else
 	APIHOST=$REG
 fi
 
-[ -n "$NAME" ] || NAME=${REPO##*/}
+# default name: the build-context dir in Dockerfile mode (the base image name
+# would be wrong), else the image repo basename.
+if [ -z "$NAME" ]; then
+	if [ -n "$DOCKERFILE" ]; then NAME=$(basename -- "$(cd "$CONTEXT" && pwd)"); else NAME=${REPO##*/}; fi
+fi
 [ -n "$OUT" ]  || OUT="./$NAME"
 
 REFDESC=${DIGEST:-$TAG}
@@ -231,7 +252,12 @@ get_token() {
 
 # -------------------------------------------------------------- manifest fetch
 WORK=$(mktemp -d)
-cleanup() { rm -rf "$WORK"; }
+# Unmount any Dockerfile-build binds BEFORE removing $WORK - otherwise rm -rf
+# would recurse into bind-mounted /proc, /dev, /sys (i.e. the host's!).
+cleanup() {
+	for _m in proc dev sys; do umount "$WORK/rootfs/$_m" 2>/dev/null || true; done
+	rm -rf "$WORK"
+}
 trap cleanup EXIT INT TERM
 
 get_token
@@ -375,6 +401,96 @@ printf '%s' "$LAYERS" | while IFS='	' read -r bp mt; do
 		decompress_to "$bp" "$mt" | tar -x -p -C "$ROOTFS" 2>/dev/null || true
 	fi
 done
+
+# ------------------------------------------------------- dockerfile build ----
+# Apply the Dockerfile on top of the FROM rootfs: RUN runs inside the rootfs
+# (chroot, with /proc /dev /sys bound and the host resolver for network), COPY/ADD
+# pull files from the build context, and ENV/WORKDIR/USER/CMD/ENTRYPOINT update
+# the image config (read by the config.json step below). Single-stage, host arch.
+if [ -n "$DOCKERFILE" ]; then
+	command -v chroot >/dev/null 2>&1 || die "chroot not found (needed for Dockerfile RUN)"
+
+	cp "$CONFIG_BLOB" "$WORK/image-config.mut.json"
+	CONFIG_BLOB="$WORK/image-config.mut.json"
+	cfg_jq() { jq "$@" "$CONFIG_BLOB" > "$WORK/.cfg" && mv "$WORK/.cfg" "$CONFIG_BLOB"; }
+
+	DF_WD=$(jq -r '.config.WorkingDir // "/"' "$CONFIG_BLOB"); [ -n "$DF_WD" ] || DF_WD=/
+	DF_ENV=""   # "export K=V; " prefix applied to each RUN
+
+	mnt_up() {
+		mkdir -p "$ROOTFS/proc" "$ROOTFS/dev" "$ROOTFS/sys" "$ROOTFS/etc"
+		mount -o bind /proc "$ROOTFS/proc" 2>/dev/null || die "cannot bind /proc into rootfs (need root)"
+		mount -o bind /dev  "$ROOTFS/dev"  2>/dev/null || true
+		mount -o bind /sys  "$ROOTFS/sys"  2>/dev/null || true
+		[ -f /etc/resolv.conf ] && cp -L /etc/resolv.conf "$ROOTFS/etc/resolv.conf" 2>/dev/null || true
+	}
+	mnt_down() { for _m in proc dev sys; do umount "$ROOTFS/$_m" 2>/dev/null || true; done; }
+
+	# logical lines: drop full-line comments, join backslash continuations
+	grep -vE '^[[:space:]]*#' "$DOCKERFILE" | awk '
+		function emit(s){ sub(/^[ \t]+/,"",s); sub(/[ \t]+$/,"",s); if(s!="") print s }
+		{ sub(/\r$/,""); l=$0; if(buf!=""){ l=buf " " l; buf="" }
+		  if(l ~ /\\[ \t]*$/){ sub(/\\[ \t]*$/,"",l); buf=l; next } emit(l) }
+		END{ if(buf!="") emit(buf) }' > "$WORK/df.lines"
+
+	mnt_up
+	while IFS= read -r dl; do
+		[ -n "$dl" ] || continue
+		kw=$(printf '%s' "$dl" | awk '{print toupper($1)}')
+		arg=$(printf '%s' "$dl" | sed 's/^[^[:space:]]*[[:space:]]*//')
+		case $kw in
+			FROM) ;;   # base, already pulled
+			RUN)
+				log "  RUN $arg"
+				chroot "$ROOTFS" /bin/sh -c "${DF_ENV}cd \"$DF_WD\" 2>/dev/null || true
+$arg" || { mnt_down; die "RUN failed: $arg"; }
+				;;
+			COPY|ADD)
+				set -- $arg
+				while [ $# -gt 1 ]; do case $1 in --*) shift ;; *) break ;; esac; done
+				[ $# -ge 2 ] || { mnt_down; die "$kw needs <src>... <dst>: $dl"; }
+				eval "dst=\${$#}"
+				ddst="$ROOTFS/$dst"
+				case $dst in */) mkdir -p "$ddst" ;; *) mkdir -p "$(dirname "$ddst")" ;; esac
+				i=1
+				for s in "$@"; do
+					if [ "$i" -lt "$#" ]; then
+						cp -a "$CONTEXT/$s" "$ddst" || { mnt_down; die "$kw: cannot copy $s"; }
+					fi
+					i=$((i+1))
+				done
+				log "  $kw -> $dst"
+				;;
+			ENV)
+				case $arg in
+					*=*) k=${arg%%=*}; v=${arg#*=} ;;   # K=V (rest of line = value)
+					*)   k=${arg%% *}; v=${arg#* } ;;    # legacy: K V
+				esac
+				case $v in \"*\") v=${v#\"}; v=${v%\"} ;; \'*\') v=${v#\'}; v=${v%\'} ;; esac
+				cfg_jq --arg k "$k" --arg v "$v" \
+					'.config.Env = ((.config.Env // []) | map(select(startswith($k+"=")|not))) + [$k+"="+$v]'
+				DF_ENV="${DF_ENV}export $k=\"$v\"; "
+				log "  ENV $k=$v"
+				;;
+			WORKDIR)
+				DF_WD=$arg; mkdir -p "$ROOTFS/$arg"
+				cfg_jq --arg d "$arg" '.config.WorkingDir = $d'
+				;;
+			USER) cfg_jq --arg u "$arg" '.config.User = $u' ;;
+			CMD)
+				case $arg in \[*) cfg_jq --argjson a "$arg" '.config.Cmd = $a' ;;
+				             *)   cfg_jq --arg c "$arg" '.config.Cmd = ["/bin/sh","-c",$c]' ;; esac ;;
+			ENTRYPOINT)
+				case $arg in \[*) cfg_jq --argjson a "$arg" '.config.Entrypoint = $a' ;;
+				             *)   cfg_jq --arg c "$arg" '.config.Entrypoint = ["/bin/sh","-c",$c]' ;; esac ;;
+			EXPOSE|VOLUME|LABEL|ARG|MAINTAINER|SHELL|STOPSIGNAL|HEALTHCHECK|ONBUILD)
+				vlog "($kw ignored)" ;;
+			*) log "  WARNING: unknown Dockerfile instruction ignored: $kw" ;;
+		esac
+	done < "$WORK/df.lines"
+	mnt_down
+	log "==> dockerfile build complete"
+fi
 
 # --------------------------------------------------- image config -> runtime ---
 log "==> generating uxc config.json"
