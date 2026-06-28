@@ -47,6 +47,7 @@ REGISTER=1
 AUTOSTART=0
 INFRA=""
 UXC_DIR="${DOCKER2UXC_UXCDIR:-/etc/uxc}"
+AUTH_FILE="${DOCKER2UXC_AUTH:-/etc/uxcd/auth.json}"   # Docker-format { "auths": { host: { auth | username/password } } }
 DOCKERFILE=""
 CONTEXT=""
 PROV_IMAGE=""   # provenance: the pulled ref + the digest it resolved to, recorded
@@ -93,6 +94,8 @@ Options:
       --privileged     set process.noNewPrivileges=false (allow setuid/privilege gain)
       --autostart      register the container to start on boot
       --infra NAME     register the container as a member of shared netns NAME
+      --auth-file F    registry credentials, Docker config.json "auths" format
+                       (default: \$DOCKER2UXC_AUTH or /etc/uxcd/auth.json)
       --no-register    only build the bundle; do not write $UXC_DIR/<name>.json
       --resolve-digest print the digest the ref resolves to and exit (no build;
                        used by uxcd to detect image updates)
@@ -142,6 +145,7 @@ while [ $# -gt 0 ]; do
 		--dockerfile)  DOCKERFILE=$2; shift 2 ;;
 		--context)     CONTEXT=$2; shift 2 ;;
 		--cache)       CACHE=$2; shift 2 ;;
+		--auth-file)   AUTH_FILE=$2; shift 2 ;;
 		--no-verify)   VERIFY=0; shift ;;
 		-f|--force)    FORCE=1; shift ;;
 		-v|--verbose)  VERBOSE=1; shift ;;
@@ -262,19 +266,42 @@ log "==> bundle:   $OUT  (name: $NAME)"
 # wget wrapper: $1=url $2=outfile, remaining args are extra --header values.
 ACCEPT_MANIFEST='application/vnd.oci.image.index.v1+json, application/vnd.docker.distribution.manifest.list.v2+json, application/vnd.oci.image.manifest.v1+json, application/vnd.docker.distribution.manifest.v2+json'
 TOKEN=""
+BASIC=""   # base64 user:pass for a pure-Basic (no token endpoint) private registry
 
 http_get() {
 	_url=$1; _out=$2; shift 2
 	set -- "$@"
 	if [ -n "$TOKEN" ]; then
 		wget -q -O "$_out" --header="Authorization: Bearer $TOKEN" "$@" "$_url"
+	elif [ -n "$BASIC" ]; then
+		wget -q -O "$_out" --header="Authorization: Basic $BASIC" "$@" "$_url"
 	else
 		wget -q -O "$_out" "$@" "$_url"
 	fi
 }
 
+# Resolve base64 "user:pass" (the Docker "auth" value) for $REG from AUTH_FILE,
+# or empty. Tries the registry host plus Docker Hub's legacy key aliases, and
+# accepts either an "auth" field or separate username/password.
+registry_creds() {
+	[ -n "$AUTH_FILE" ] && [ -f "$AUTH_FILE" ] || return 0
+	case $REG in
+		docker.io) _keys='docker.io registry-1.docker.io index.docker.io https://index.docker.io/v1/' ;;
+		*)         _keys="$REG" ;;
+	esac
+	for _k in $_keys; do
+		_a=$(jq -r --arg k "$_k" '.auths[$k].auth // empty' "$AUTH_FILE" 2>/dev/null)
+		[ -n "$_a" ] && { printf '%s' "$_a"; return 0; }
+		_u=$(jq -r --arg k "$_k" '.auths[$k].username // empty' "$AUTH_FILE" 2>/dev/null)
+		_p=$(jq -r --arg k "$_k" '.auths[$k].password // empty' "$AUTH_FILE" 2>/dev/null)
+		[ -n "$_u" ] && { printf '%s:%s' "$_u" "$_p" | base64 | tr -d '\n'; return 0; }
+	done
+	return 0
+}
+
 get_token() {
-	# Per-registry anonymous token. Returns 0 and sets TOKEN, or leaves it empty.
+	# Per-registry token. With credentials (registry_creds) it is an authenticated
+	# token good for private repos; otherwise anonymous. Sets TOKEN, or empty.
 	_scope="repository:$REPO:pull"
 	_tokurl=""
 	case $REG in
@@ -283,12 +310,20 @@ get_token() {
 		quay.io)        _tokurl="https://quay.io/v2/auth?service=quay.io&scope=$_scope" ;;
 		*)              _tokurl="https://$REG/token?scope=$_scope" ;;
 	esac
+	_creds=$(registry_creds)
 	_tf=$(mktemp)
-	if wget -q -O "$_tf" "$_tokurl" 2>/dev/null; then
-		TOKEN=$(jq -r '.token // .access_token // empty' "$_tf" 2>/dev/null || true)
+	if [ -n "$_creds" ]; then
+		vlog "using credentials for $REG"
+		wget -q -O "$_tf" --header="Authorization: Basic $_creds" "$_tokurl" 2>/dev/null &&
+			TOKEN=$(jq -r '.token // .access_token // empty' "$_tf" 2>/dev/null || true)
+	else
+		wget -q -O "$_tf" "$_tokurl" 2>/dev/null &&
+			TOKEN=$(jq -r '.token // .access_token // empty' "$_tf" 2>/dev/null || true)
 	fi
 	rm -f "$_tf"
-	[ -n "$TOKEN" ] && vlog "got anonymous token (${#TOKEN} chars)" || vlog "no token (anonymous registry?)"
+	# pure-Basic registry (no token endpoint) but we have credentials: use Basic
+	[ -z "$TOKEN" ] && [ -n "$_creds" ] && BASIC=$_creds
+	[ -n "$TOKEN" ] && vlog "got token (${#TOKEN} chars)" || vlog "no token (anonymous or Basic registry)"
 }
 
 # -------------------------------------------------------------- manifest fetch
