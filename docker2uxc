@@ -48,6 +48,8 @@ INFRA=""
 UXC_DIR="${DOCKER2UXC_UXCDIR:-/etc/uxc}"
 DOCKERFILE=""
 CONTEXT=""
+PROV_IMAGE=""   # provenance: the pulled ref + the digest it resolved to, recorded
+PROV_DIGEST=""  # in the registry so uxcd can detect updates (direct pulls only)
 
 # --------------------------------------------------------------------- usage --
 usage() {
@@ -274,6 +276,14 @@ log "==> resolving manifest"
 http_get "https://$APIHOST/v2/$REPO/manifests/$REFDESC" "$WORK/idx.json" \
 	--header="Accept: $ACCEPT_MANIFEST" \
 	|| die "failed to fetch manifest (private image, or wrong ref?)"
+
+# provenance: the digest this ref resolved to (sha256 of the index/manifest the
+# tag points to) lets uxcd later re-resolve the same ref and detect an update.
+# Only for direct pulls - a Dockerfile FROM is the base image, not "the image".
+if [ -z "$DOCKERFILE" ]; then
+	PROV_IMAGE=$REF
+	PROV_DIGEST="sha256:$(sha256sum "$WORK/idx.json" | awk '{print $1}')"
+fi
 
 MTYPE=$(jq -r '.mediaType // ""' "$WORK/idx.json")
 case $MTYPE in
@@ -812,6 +822,8 @@ if [ "$REGISTER" -eq 1 ]; then
 		printf '\t"name": %s,\n' "$(printf '%s' "$NAME" | jq -R .)"
 		[ "$AUTOSTART" -eq 1 ] && printf '\t"autostart": true,\n'
 		[ -n "$INFRA" ] && printf '\t"infra": %s,\n' "$(printf '%s' "$INFRA" | jq -R .)"
+		[ -n "$PROV_IMAGE" ]  && printf '\t"image": %s,\n'  "$(printf '%s' "$PROV_IMAGE"  | jq -R .)"
+		[ -n "$PROV_DIGEST" ] && printf '\t"digest": %s,\n' "$(printf '%s' "$PROV_DIGEST" | jq -R .)"
 		printf '\t"path": %s\n' "$(printf '%s' "$ABS_OUT" | jq -R .)"
 		printf '}\n'
 	} > "$UXC_DIR/$NAME.json"
