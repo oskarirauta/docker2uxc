@@ -50,6 +50,7 @@ DOCKERFILE=""
 CONTEXT=""
 PROV_IMAGE=""   # provenance: the pulled ref + the digest it resolved to, recorded
 PROV_DIGEST=""  # in the registry so uxcd can detect updates (direct pulls only)
+RESOLVE_ONLY=0  # --resolve-digest: print the digest the ref resolves to and exit
 
 # --------------------------------------------------------------------- usage --
 usage() {
@@ -90,6 +91,8 @@ Options:
       --autostart      register the container to start on boot
       --infra NAME     register the container as a member of shared netns NAME
       --no-register    only build the bundle; do not write $UXC_DIR/<name>.json
+      --resolve-digest print the digest the ref resolves to and exit (no build;
+                       used by uxcd to detect image updates)
       --dockerfile F   build from a Dockerfile instead of pulling a ready image
                        (FROM gives the base; RUN/COPY/ADD/ENV/WORKDIR/USER/CMD/
                        ENTRYPOINT supported; single-stage, host architecture)
@@ -128,6 +131,7 @@ while [ $# -gt 0 ]; do
 		--autostart)   AUTOSTART=1; shift ;;
 		--infra)       INFRA=$2; shift 2 ;;
 		--no-register) REGISTER=0; shift ;;
+		--resolve-digest) RESOLVE_ONLY=1; shift ;;
 		--dockerfile)  DOCKERFILE=$2; shift 2 ;;
 		--context)     CONTEXT=$2; shift 2 ;;
 		--cache)       CACHE=$2; shift 2 ;;
@@ -284,6 +288,11 @@ if [ -z "$DOCKERFILE" ]; then
 	PROV_IMAGE=$REF
 	PROV_DIGEST="sha256:$(sha256sum "$WORK/idx.json" | awk '{print $1}')"
 fi
+
+# --resolve-digest: print the digest the ref resolves to (manifest-only, no
+# blobs) and stop. Used by uxcd's update check; logs go to stderr so stdout is
+# just the digest.
+[ "$RESOLVE_ONLY" -eq 1 ] && { printf 'sha256:%s\n' "$(sha256sum "$WORK/idx.json" | awk '{print $1}')"; exit 0; }
 
 MTYPE=$(jq -r '.mediaType // ""' "$WORK/idx.json")
 case $MTYPE in
