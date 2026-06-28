@@ -850,18 +850,30 @@ ABS_OUT=$(cd "$OUT" && pwd)
 # user and survive image re-pulls. The bundle itself stays the image's config.
 if [ "$REGISTER" -eq 1 ]; then
 	mkdir -p "$UXC_DIR"
-	{
-		printf '{\n'
-		printf '\t"name": %s,\n' "$(printf '%s' "$NAME" | jq -R .)"
-		[ "$AUTOSTART" -eq 1 ] && printf '\t"autostart": true,\n'
-		[ -n "$INFRA" ] && printf '\t"infra": %s,\n' "$(printf '%s' "$INFRA" | jq -R .)"
-		[ -n "$PROV_IMAGE" ]  && printf '\t"image": %s,\n'  "$(printf '%s' "$PROV_IMAGE"  | jq -R .)"
-		[ -n "$PROV_DIGEST" ] && printf '\t"digest": %s,\n' "$(printf '%s' "$PROV_DIGEST" | jq -R .)"
-		printf '\t"path": %s\n' "$(printf '%s' "$ABS_OUT" | jq -R .)"
-		printf '}\n'
-	} > "$UXC_DIR/$NAME.json"
+	_reg="$UXC_DIR/$NAME.json"
+	# Overlay of the fields this (re-)registration sets. autostart/infra are
+	# included only when given as flags, so a re-pull preserves the existing ones.
+	jq -n \
+		--arg name "$NAME" \
+		--arg path "$ABS_OUT" \
+		--arg image "$PROV_IMAGE" \
+		--arg digest "$PROV_DIGEST" \
+		--arg infra "$INFRA" \
+		--argjson autostart "$([ "$AUTOSTART" -eq 1 ] && echo true || echo false)" \
+		'{name:$name, path:$path}
+		 + (if $image  != "" then {image:$image}   else {} end)
+		 + (if $digest != "" then {digest:$digest} else {} end)
+		 + (if $infra  != "" then {infra:$infra}   else {} end)
+		 + (if $autostart    then {autostart:true} else {} end)' > "$_reg.new"
+	# Merge into an existing entry so user overrides (volumes/devices/env/...) and
+	# any autostart/infra survive a re-pull/upgrade; otherwise write it fresh.
+	if [ -f "$_reg" ] && jq -e . "$_reg" >/dev/null 2>&1; then
+		jq -s '.[0] + .[1]' "$_reg" "$_reg.new" > "$_reg.tmp" && mv "$_reg.tmp" "$_reg" && rm -f "$_reg.new"
+	else
+		mv "$_reg.new" "$_reg"
+	fi
 	log ""
-	log "==> registered: $UXC_DIR/$NAME.json"
+	log "==> registered: $_reg"
 fi
 
 log ""
