@@ -34,6 +34,7 @@ VERIFY=1
 FORCE=0
 VERBOSE=0
 RW_OVERLAY=0
+NNP=true        # OCI process.noNewPrivileges (secure default); --privileged sets it false
 CAPS=permissive
 PROFILE=""
 NETWORK=host
@@ -89,6 +90,7 @@ Options:
                        become available (e.g. for uxcd).
       --caps SET       permissive | minimal       (default: permissive)
       --rw-overlay     tune config for a writable overlay (uxc --write-overlay-path)
+      --privileged     set process.noNewPrivileges=false (allow setuid/privilege gain)
       --autostart      register the container to start on boot
       --infra NAME     register the container as a member of shared netns NAME
       --no-register    only build the bundle; do not write $UXC_DIR/<name>.json
@@ -131,6 +133,7 @@ while [ $# -gt 0 ]; do
 		--no-accounting) ACCOUNTING=0; shift ;;
 		--caps)        CAPS=$2; shift 2 ;;
 		--rw-overlay)  RW_OVERLAY=1; shift ;;
+		--privileged)  NNP=false; shift ;;
 		--autostart)   AUTOSTART=1; shift ;;
 		--infra)       INFRA=$2; shift 2 ;;
 		--no-register) REGISTER=0; shift ;;
@@ -613,6 +616,7 @@ jq -n \
 	--argjson gid "$GID_N" \
 	--argjson caps "$CAPSET" \
 	--argjson roroot "$RO_ROOT" \
+	--argjson nnp "$NNP" \
 	--argjson ns "$NS_JSON" \
 	--argjson resolv "$RESOLV_MOUNT" \
 	--argjson res "$RES_JSON" \
@@ -637,7 +641,7 @@ jq -n \
 	      permitted: $caps, ambient: []
 	    },
 	    rlimits: [ { type: "RLIMIT_NOFILE", hard: 1048576, soft: 1048576 } ],
-	    noNewPrivileges: false
+	    noNewPrivileges: $nnp
 	  },
 	  root: { path: "rootfs", readonly: $roroot },
 	  mounts: [
