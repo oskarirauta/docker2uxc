@@ -51,6 +51,7 @@ CONTEXT=""
 PROV_IMAGE=""   # provenance: the pulled ref + the digest it resolved to, recorded
 PROV_DIGEST=""  # in the registry so uxcd can detect updates (direct pulls only)
 RESOLVE_ONLY=0  # --resolve-digest: print the digest the ref resolves to and exit
+CHECK_UPDATES=0 # --check-updates: report which registered containers have updates
 
 # --------------------------------------------------------------------- usage --
 usage() {
@@ -93,6 +94,8 @@ Options:
       --no-register    only build the bundle; do not write $UXC_DIR/<name>.json
       --resolve-digest print the digest the ref resolves to and exit (no build;
                        used by uxcd to detect image updates)
+      --check-updates  report which registered containers have a newer image
+                       (one line per container: name<TAB>state<TAB>digest)
       --dockerfile F   build from a Dockerfile instead of pulling a ready image
                        (FROM gives the base; RUN/COPY/ADD/ENV/WORKDIR/USER/CMD/
                        ENTRYPOINT supported; single-stage, host architecture)
@@ -132,6 +135,7 @@ while [ $# -gt 0 ]; do
 		--infra)       INFRA=$2; shift 2 ;;
 		--no-register) REGISTER=0; shift ;;
 		--resolve-digest) RESOLVE_ONLY=1; shift ;;
+		--check-updates)  CHECK_UPDATES=1; shift ;;
 		--dockerfile)  DOCKERFILE=$2; shift 2 ;;
 		--context)     CONTEXT=$2; shift 2 ;;
 		--cache)       CACHE=$2; shift 2 ;;
@@ -145,6 +149,26 @@ while [ $# -gt 0 ]; do
 		*)             break ;;
 	esac
 done
+
+# --check-updates: for each registered container that has image+digest, resolve
+# the current upstream digest (self-exec --resolve-digest) and report
+#   <name>\t<current|update|error>\t<digest>
+# uxcd runs this as one child for its on-demand update check. No positional ref.
+if [ "$CHECK_UPDATES" -eq 1 ]; then
+	need jq
+	for _f in "$UXC_DIR"/*.json; do
+		[ -f "$_f" ] || continue
+		_n=$(basename -- "$_f" .json)
+		_img=$(jq -r '.image // empty' "$_f" 2>/dev/null)
+		_old=$(jq -r '.digest // empty' "$_f" 2>/dev/null)
+		[ -n "$_img" ] && [ -n "$_old" ] || continue
+		_new=$("$0" --resolve-digest "$_img" 2>/dev/null) || _new=""
+		if   [ -z "$_new" ];        then printf '%s\terror\t\n'   "$_n"
+		elif [ "$_new" = "$_old" ]; then printf '%s\tcurrent\t%s\n' "$_n" "$_new"
+		else                             printf '%s\tupdate\t%s\n'  "$_n" "$_new"; fi
+	done
+	exit 0
+fi
 
 # In Dockerfile mode the base image comes from FROM, not a positional argument.
 if [ -n "$DOCKERFILE" ]; then
