@@ -17,6 +17,7 @@ OBJS:= \
 	objs/reg.o \
 	objs/dockerfile.o \
 	objs/emit.o \
+	objs/convert.o \
 	objs/main.o
 
 # dependency trees: json_cpp; logger_cpp -> common_cpp -> rva/tsl; usage_cpp
@@ -74,6 +75,9 @@ objs/dockerfile.o: src/dockerfile.cpp
 	$(CXX) $(CXXFLAGS) $(INCLUDES) -c -o $@ $<;
 
 objs/emit.o: src/emit.cpp
+	$(CXX) $(CXXFLAGS) $(INCLUDES) -c -o $@ $<;
+
+objs/convert.o: src/convert.cpp
 	$(CXX) $(CXXFLAGS) $(INCLUDES) -c -o $@ $<;
 
 # libraries AFTER the objects (--as-needed toolchains)
