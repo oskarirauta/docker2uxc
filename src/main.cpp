@@ -8,8 +8,22 @@
 #include "http.hpp"
 #include "registry.hpp"
 #include "sha256.hpp"
+#include "manifest.hpp"
+#include <sys/utsname.h>
 
 #define D2U_VERSION "0.2.0-dev"
+
+static std::string host_arch() {
+	struct utsname u;
+	if ( uname(&u) != 0 ) return "amd64";
+	std::string m = u.machine;
+	if ( m == "x86_64" )  return "amd64";
+	if ( m == "aarch64" ) return "arm64";
+	if ( m == "armv7l" )  return "arm/v7";
+	if ( m == "armv6l" )  return "arm/v6";
+	if ( m == "i386" || m == "i686" ) return "386";
+	return m;
+}
 
 int main(int argc, char** argv) {
 
@@ -69,7 +83,26 @@ int main(int argc, char** argv) {
 		return 0;
 	}
 
-	logger::error << "docker2uxc: pull/build not wired yet (next increment)" << std::endl;
+	// default: pull (partial - manifest resolution; download/extract/bundle land next)
+	std::string arch = (bool)usage["arch"] ? usage["arch"].value : host_arch();
+	std::string arch_base = arch, arch_var;
+	std::string::size_type s = arch.find('/');
+	if ( s != std::string::npos ) { arch_base = arch.substr(0, s); arch_var = arch.substr(s + 1); }
+
+	manifest::Image img;
+	std::string merr;
+	if ( !manifest::resolve(ref, arch_base, arch_var, auth_file, img, merr)) {
+		logger::error << "docker2uxc: " << merr << std::endl;
+		http::global_cleanup();
+		return 1;
+	}
+	logger::info << "arch:    linux/" << arch << std::endl;
+	logger::info << "config:  " << img.config_digest << std::endl;
+	logger::info << "layers:  " << img.layers.size() << std::endl;
+	for ( const auto& L : img.layers )
+		logger::verbose << "  layer " << L.digest.substr(0, 19) << "..  " << L.media_type << std::endl;
+
+	logger::error << "docker2uxc: blob download / secure extract / bundle - next increment" << std::endl;
 	http::global_cleanup();
 	return 1;
 }
