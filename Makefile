@@ -6,6 +6,7 @@ LDFLAGS?=-L/lib -L/usr/lib
 
 OBJS:= \
 	objs/ref.o \
+	objs/http.o \
 	objs/main.o
 
 # dependency trees: json_cpp; logger_cpp -> common_cpp -> rva/tsl; usage_cpp
@@ -30,6 +31,9 @@ objs/main.o: src/main.cpp
 	$(CXX) $(CXXFLAGS) $(INCLUDES) -c -o $@ $<;
 
 objs/ref.o: src/ref.cpp
+	$(CXX) $(CXXFLAGS) $(INCLUDES) -c -o $@ $<;
+
+objs/http.o: src/http.cpp
 	$(CXX) $(CXXFLAGS) $(INCLUDES) -c -o $@ $<;
 
 # libraries AFTER the objects (--as-needed toolchains)
