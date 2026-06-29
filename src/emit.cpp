@@ -129,7 +129,7 @@ bool netconfig(const std::string& out, const std::string& name, const std::strin
 		"# docker2uxc: /etc/config/network snippet for isolated container '" + name + "'.\n"
 		"# NOT applied automatically - review, edit the bridge/addressing, then apply with:\n"
 		"#     cat network.uci >> /etc/config/network && /etc/init.d/network reload\n"
-		"# See docs/uxc-networking.md for the full explanation.\n"
+		"# See the uxcd networking docs (docs/networking.md) for the full explanation.\n"
 		"\n"
 		"# 1) veth pair: host side '" + host + "', container side '" + peer + "'\n"
 		"config device\n"
