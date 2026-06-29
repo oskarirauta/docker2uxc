@@ -13,6 +13,8 @@ OBJS:= \
 	objs/work.o \
 	objs/archive.o \
 	objs/extract.o \
+	objs/bundle.o \
+	objs/reg.o \
 	objs/main.o
 
 # dependency trees: json_cpp; logger_cpp -> common_cpp -> rva/tsl; usage_cpp
@@ -58,6 +60,12 @@ objs/archive.o: src/archive.cpp
 	$(CXX) $(CXXFLAGS) $(INCLUDES) -c -o $@ $<;
 
 objs/extract.o: src/extract.cpp
+	$(CXX) $(CXXFLAGS) $(INCLUDES) -c -o $@ $<;
+
+objs/bundle.o: src/bundle.cpp
+	$(CXX) $(CXXFLAGS) $(INCLUDES) -c -o $@ $<;
+
+objs/reg.o: src/reg.cpp
 	$(CXX) $(CXXFLAGS) $(INCLUDES) -c -o $@ $<;
 
 # libraries AFTER the objects (--as-needed toolchains)

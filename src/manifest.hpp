@@ -11,8 +11,10 @@ struct Layer {
 };
 
 struct Image {
-	std::string config_digest;     // the OCI image config blob
-	std::vector<Layer> layers;     // ordered, bottom-up
+	std::string config_digest;       // the OCI image config blob
+	std::vector<Layer> layers;       // ordered, bottom-up
+	std::string provenance_digest;   // "sha256:..." of the ref-resolved manifest (uxcd's update digest)
+	std::string manifest_json;       // the selected image manifest bytes (for the bundle's manifest.json)
 };
 
 // Resolve `ref` to a single-platform image: fetch the manifest, and if it is a

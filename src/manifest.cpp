@@ -1,6 +1,7 @@
 #include "manifest.hpp"
 #include "registry.hpp"
 #include "json.hpp"
+#include "sha256.hpp"
 
 namespace manifest {
 
@@ -8,6 +9,7 @@ bool resolve(const ImageRef& ref, const std::string& arch_base, const std::strin
              const std::string& auth_file, Image& out, std::string& err) {
 	std::string body;
 	if ( !registry::fetch_manifest(ref, auth_file, body, err)) return false;
+	out.provenance_digest = "sha256:" + sha256_hex(body);   // digest of the ref-resolved manifest
 
 	try {
 		JSON m = JSON::parse(body);
@@ -52,6 +54,7 @@ bool resolve(const ImageRef& ref, const std::string& arch_base, const std::strin
 			err = "not an image manifest (missing config/layers)";
 			return false;
 		}
+		out.manifest_json = body;   // the selected single-platform image manifest
 		JSON cfg = m["config"];
 		out.config_digest = cfg.contains("digest") ? cfg["digest"].to_string() : "";
 
