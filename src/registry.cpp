@@ -15,7 +15,6 @@ static const char* ACCEPT_MANIFEST =
 	"application/vnd.oci.image.manifest.v1+json, "
 	"application/vnd.docker.distribution.manifest.v2+json";
 
-// minimal base64 (for the Docker "auth" / user:pass credential)
 static std::string b64(const std::string& in) {
 	static const char* T = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
 	std::string out;
@@ -29,7 +28,6 @@ static std::string b64(const std::string& in) {
 	return out;
 }
 
-// pull key="value" out of a WWW-Authenticate Bearer header
 static std::string www_attr(const std::string& h, const std::string& key) {
 	std::string needle = key + "=\"";
 	std::string::size_type p = h.find(needle);
@@ -71,22 +69,20 @@ static std::string registry_creds(const std::string& reg, const std::string& aut
 	return "";
 }
 
-bool fetch_manifest(const ImageRef& ref, const std::string& auth_file, std::string& body, std::string& err) {
-	std::string url = "https://" + ref.apihost + "/v2/" + ref.repo + "/manifests/" + ref.refdesc();
-	std::vector<std::string> headers = { ACCEPT_MANIFEST };
+// Ping /v2/; if it 401s, obtain a pull-scoped token (Basic creds when present)
+// and return the Authorization header(s) to attach. Empty for an open registry.
+static bool authenticate(const ImageRef& ref, const std::string& auth_file,
+                         std::vector<std::string>& auth, std::string& err) {
+	http::Response ping;
+	if ( !http::get("https://" + ref.apihost + "/v2/", {}, ping, err)) return false;
+	if ( ping.status == 200 ) { auth.clear(); return true; }
+	if ( ping.status != 401 ) { err = "registry /v2/ HTTP " + std::to_string(ping.status); return false; }
 
-	http::Response r;
-	if ( !http::get(url, headers, r, err)) return false;
-	if ( r.status == 200 ) { body = std::move(r.body); return true; }
-	if ( r.status != 401 ) { err = "manifest HTTP " + std::to_string(r.status); return false; }
-
-	// 401: authenticate from the Bearer challenge
-	std::string wa = r.header("www-authenticate");
+	std::string wa = ping.header("www-authenticate");
 	std::string realm = www_attr(wa, "realm");
 	std::string service = www_attr(wa, "service");
-	std::string scope = www_attr(wa, "scope");
-	if ( scope.empty()) scope = "repository:" + ref.repo + ":pull";
 	if ( realm.empty()) { err = "registry 401 without a Bearer realm"; return false; }
+	std::string scope = "repository:" + ref.repo + ":pull";
 
 	std::string creds = registry_creds(ref.reg, auth_file);
 	if ( !creds.empty()) logger::verbose << "registry: using credentials for " << ref.reg << std::endl;
@@ -106,20 +102,30 @@ bool fetch_manifest(const ImageRef& ref, const std::string& auth_file, std::stri
 		} catch ( ... ) {}
 	}
 
-	if ( !token.empty()) {
-		headers.push_back("Authorization: Bearer " + token);
-	} else if ( !creds.empty()) {
-		headers.push_back("Authorization: Basic " + creds);   // pure-Basic registry fallback
-	} else {
-		err = "could not obtain a registry token (private image, or wrong/missing credentials)";
-		return false;
-	}
+	if ( !token.empty()) auth = { "Authorization: Bearer " + token };
+	else if ( !creds.empty()) auth = { "Authorization: Basic " + creds };   // pure-Basic registry
+	else { err = "could not authenticate to " + ref.reg + " (private image, or wrong/missing credentials)"; return false; }
+	return true;
+}
 
-	http::Response r2;
-	if ( !http::get(url, headers, r2, err)) return false;
-	if ( r2.status == 200 ) { body = std::move(r2.body); return true; }
-	err = "manifest HTTP " + std::to_string(r2.status) + " after authentication";
-	return false;
+bool fetch_manifest(const ImageRef& ref, const std::string& auth_file, std::string& body, std::string& err) {
+	std::vector<std::string> headers;
+	if ( !authenticate(ref, auth_file, headers, err)) return false;
+	headers.push_back(ACCEPT_MANIFEST);
+	std::string url = "https://" + ref.apihost + "/v2/" + ref.repo + "/manifests/" + ref.refdesc();
+	http::Response r;
+	if ( !http::get(url, headers, r, err)) return false;
+	if ( r.status != 200 ) { err = "manifest HTTP " + std::to_string(r.status); return false; }
+	body = std::move(r.body);
+	return true;
+}
+
+bool fetch_blob(const ImageRef& ref, const std::string& digest, const std::string& auth_file,
+                const std::string& outfile, std::string& err) {
+	std::vector<std::string> headers;
+	if ( !authenticate(ref, auth_file, headers, err)) return false;
+	std::string url = "https://" + ref.apihost + "/v2/" + ref.repo + "/blobs/" + digest;
+	return http::get_to_file(url, headers, outfile, err);
 }
 
 }

@@ -3,6 +3,7 @@
 #include <cctype>
 #include <algorithm>
 #include <curl/curl.h>
+#include "work.hpp"
 
 namespace http {
 
@@ -21,6 +22,11 @@ static size_t header_cb(char* ptr, size_t sz, size_t n, void* ud) {
 	while ( !line.empty() && ( line.back() == '\r' || line.back() == '\n' )) line.pop_back();
 	if ( !line.empty()) hs->push_back(line);
 	return sz * n;
+}
+
+// abort the transfer promptly when a cancel (SIGTERM) arrives
+static int xfer_cb(void*, curl_off_t, curl_off_t, curl_off_t, curl_off_t) {
+	return work::cancelled ? 1 : 0;
 }
 
 static curl_slist* build_headers(const std::vector<std::string>& hs) {
@@ -54,7 +60,9 @@ bool get(const std::string& url, const std::vector<std::string>& extra, Response
 	curl_slist* sl = build_headers(extra);
 
 	curl_easy_setopt(c, CURLOPT_URL, url.c_str());
-	curl_easy_setopt(c, CURLOPT_FOLLOWLOCATION, 1L);   // libcurl strips Authorization on cross-origin redirect
+	curl_easy_setopt(c, CURLOPT_FOLLOWLOCATION, 1L);
+	curl_easy_setopt(c, CURLOPT_NOPROGRESS, 0L);
+	curl_easy_setopt(c, CURLOPT_XFERINFOFUNCTION, xfer_cb);   // libcurl strips Authorization on cross-origin redirect
 	curl_easy_setopt(c, CURLOPT_MAXREDIRS, 8L);
 	curl_easy_setopt(c, CURLOPT_WRITEFUNCTION, to_string_cb);
 	curl_easy_setopt(c, CURLOPT_WRITEDATA, &resp.body);
@@ -66,7 +74,7 @@ bool get(const std::string& url, const std::vector<std::string>& extra, Response
 
 	CURLcode rc = curl_easy_perform(c);
 	if ( rc == CURLE_OK ) curl_easy_getinfo(c, CURLINFO_RESPONSE_CODE, &resp.status);
-	else err = curl_easy_strerror(rc);
+	else err = work::cancelled ? "cancelled" : curl_easy_strerror(rc);
 
 	if ( sl ) curl_slist_free_all(sl);
 	curl_easy_cleanup(c);
@@ -82,6 +90,8 @@ bool get_to_file(const std::string& url, const std::vector<std::string>& extra, 
 
 	curl_easy_setopt(c, CURLOPT_URL, url.c_str());
 	curl_easy_setopt(c, CURLOPT_FOLLOWLOCATION, 1L);
+	curl_easy_setopt(c, CURLOPT_NOPROGRESS, 0L);
+	curl_easy_setopt(c, CURLOPT_XFERINFOFUNCTION, xfer_cb);
 	curl_easy_setopt(c, CURLOPT_MAXREDIRS, 8L);
 	curl_easy_setopt(c, CURLOPT_WRITEFUNCTION, to_file_cb);
 	curl_easy_setopt(c, CURLOPT_WRITEDATA, f);
@@ -90,7 +100,7 @@ bool get_to_file(const std::string& url, const std::vector<std::string>& extra, 
 	if ( sl ) curl_easy_setopt(c, CURLOPT_HTTPHEADER, sl);
 
 	CURLcode rc = curl_easy_perform(c);
-	if ( rc != CURLE_OK ) err = curl_easy_strerror(rc);
+	if ( rc != CURLE_OK ) err = work::cancelled ? "cancelled" : curl_easy_strerror(rc);
 
 	if ( sl ) curl_slist_free_all(sl);
 	curl_easy_cleanup(c);

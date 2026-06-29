@@ -9,6 +9,8 @@
 #include "registry.hpp"
 #include "sha256.hpp"
 #include "manifest.hpp"
+#include "work.hpp"
+#include "archive.hpp"
 #include <sys/utsname.h>
 
 #define D2U_VERSION "0.2.0-dev"
@@ -69,6 +71,7 @@ int main(int argc, char** argv) {
 
 	std::string auth_file = (bool)usage["auth-file"] ? usage["auth-file"].value : "/etc/uxcd/auth.json";
 	http::global_init();
+	work::install_signal_handlers();
 
 	// --resolve-digest: print sha256 of the resolved manifest (uxcd's update check)
 	if ( (bool)usage["resolve-digest"] ) {
@@ -99,10 +102,27 @@ int main(int argc, char** argv) {
 	logger::info << "arch:    linux/" << arch << std::endl;
 	logger::info << "config:  " << img.config_digest << std::endl;
 	logger::info << "layers:  " << img.layers.size() << std::endl;
-	for ( const auto& L : img.layers )
-		logger::verbose << "  layer " << L.digest.substr(0, 19) << "..  " << L.media_type << std::endl;
 
-	logger::error << "docker2uxc: blob download / secure extract / bundle - next increment" << std::endl;
+	work::Dir wd;
+	if ( !wd.ok()) { logger::error << "docker2uxc: cannot create work directory" << std::endl; http::global_cleanup(); return 1; }
+	std::string derr;
+
+	logger::info << "==> downloading config + " << img.layers.size() << " layers" << std::endl;
+	if ( !archive::download_verify(ref, img.config_digest, auth_file, wd.path() + "/config", derr)) {
+		logger::error << "docker2uxc: config: " << derr << std::endl; http::global_cleanup(); return 1;
+	}
+	int li = 0;
+	for ( const auto& L : img.layers ) {
+		++li;
+		if ( work::cancelled ) { logger::error << "docker2uxc: cancelled" << std::endl; http::global_cleanup(); return 1; }
+		logger::verbose << "  layer " << li << "/" << img.layers.size() << "  " << L.digest.substr(0, 19) << ".." << std::endl;
+		if ( !archive::download_verify(ref, L.digest, auth_file, wd.path() + "/layer" + std::to_string(li), derr)) {
+			logger::error << "docker2uxc: layer " << li << ": " << derr << std::endl; http::global_cleanup(); return 1;
+		}
+	}
+	logger::info << "==> all blobs downloaded and sha256-verified" << std::endl;
+
+	logger::error << "docker2uxc: decompress + secure extract + bundle - next increment" << std::endl;
 	http::global_cleanup();
 	return 1;
 }

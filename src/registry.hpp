@@ -4,12 +4,15 @@
 
 namespace registry {
 
-// Fetch the raw manifest/index document bytes for `ref`. Performs the standard
-// request -> 401 -> token -> retry dance, using credentials from `auth_file`
-// (Docker config.json "auths" format) when the repo is private. On success,
-// `body` holds the exact bytes (its sha256 is the provenance digest). Returns
-// false with `err` set on failure.
+// Fetch the raw manifest/index document bytes for `ref` (authenticates as
+// needed; uses auth_file creds for private repos). On success `body` holds the
+// exact bytes (its sha256 is the provenance digest). Returns false + err.
 bool fetch_manifest(const ImageRef& ref, const std::string& auth_file,
                     std::string& body, std::string& err);
+
+// Download a blob (config or layer) by digest to `outfile`. Does NOT verify the
+// digest - the caller does. Returns false + err on transport/HTTP failure.
+bool fetch_blob(const ImageRef& ref, const std::string& digest,
+                const std::string& auth_file, const std::string& outfile, std::string& err);
 
 }
