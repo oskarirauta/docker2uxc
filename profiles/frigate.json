@@ -1,6 +1,7 @@
 {
   "_comment": "Frigate NVR overlay. EDIT the bind 'source' paths to match your host. See profiles/README.md. shm 'size' scales with camera count/resolution.",
   "_comment_tz": "Timezone via env (Frigate honors TZ). Bind-mounting /etc/localtime is avoided because OpenWrt usually has no such file, and a missing bind source makes ujail fail the whole container. Set TZ to your zone.",
+  "_comment_devices": "GPU + Coral passthrough goes in the uxcd registry 'devices' field (/etc/uxc/<name>.json), NOT only here: the registry adds the device node AND the cgroup device-allow rule that a bundle mount alone does not grant. Add what you have, e.g. \"devices\": [\"/dev/dri\", \"/dev/apex_0\"] for an M.2/PCIe Coral, or \"/dev/bus/usb\" for a USB Coral (it re-enumerates after firmware upload, so pass the bus). See docs/configuration.md.",
   "process": {
     "env": ["TZ=UTC"],
     "capabilities": {

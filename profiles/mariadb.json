@@ -1,0 +1,14 @@
+{
+  "_comment": "MariaDB / MySQL overlay. Apply with --profile mariadb. Arrays APPEND to the base config; EDIT the data bind 'source' to a host path (it must exist). See profiles/README.md.",
+  "_comment_env": "Set MARIADB_ROOT_PASSWORD (or MARIADB_ALLOW_EMPTY_ROOT_PASSWORD / MARIADB_RANDOM_ROOT_PASSWORD) in the container's registry 'env' - NOT here, this file is shared. TZ is a convenience.",
+  "process": {
+    "env": ["TZ=UTC"]
+  },
+  "_comment_shm": "A little shared memory for the InnoDB / temp tables; raise if you tune the buffer pool high.",
+  "mounts": [
+    { "destination": "/dev/shm", "type": "tmpfs", "source": "tmpfs",
+      "options": ["nosuid", "nodev", "mode=1777", "size=128m"] },
+    { "destination": "/var/lib/mysql", "type": "bind", "source": "/srv/CHANGEME/mariadb",
+      "options": ["rbind", "rw"] }
+  ]
+}

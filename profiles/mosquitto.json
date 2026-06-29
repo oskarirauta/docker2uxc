@@ -1,0 +1,14 @@
+{
+  "_comment": "Eclipse Mosquitto (MQTT broker) overlay. Apply with --profile mosquitto. Arrays APPEND to the base config; EDIT the bind 'source' paths (they must exist). See profiles/README.md.",
+  "_comment_net": "Mosquitto listens on 1883 (+ 8883/9001 if configured). uxcd does no port mapping - run it on the host network, or in a shared 'infra' netns with the clients that need it.",
+  "_comment_config": "Provide a mosquitto.conf in the config dir (set 'persistence true' + 'persistence_location /mosquitto/data/' to keep retained messages).",
+  "process": {
+    "env": ["TZ=UTC"]
+  },
+  "mounts": [
+    { "destination": "/mosquitto/config", "type": "bind", "source": "/srv/CHANGEME/mosquitto/config",
+      "options": ["rbind", "rw"] },
+    { "destination": "/mosquitto/data", "type": "bind", "source": "/srv/CHANGEME/mosquitto/data",
+      "options": ["rbind", "rw"] }
+  ]
+}

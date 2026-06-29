@@ -1,0 +1,11 @@
+{
+  "_comment": "icecream (icecc) distributed-compile node - iceccd. Apply with --profile icecc. Arrays APPEND to the base config. See profiles/README.md.",
+  "_comment_net": "PAIR THIS WITH --network host. iceccd and the scheduler find each other by LAN broadcast (TCP 10245 + scheduler 8765/8766), which needs host networking.",
+  "_comment_arch": "icecream ships the build client's toolchain to the node, so the node needs no matching compiler installed - BUT client and node must be the same CPU architecture (x86_64 here). A weak box is better as the scheduler (icecc-scheduler); strong boxes as nodes.",
+  "_comment_rlimits": "Compiles fork heavily; give a generous process limit (the base config sets no RLIMIT_NPROC; it already sets a 1M RLIMIT_NOFILE, so don't re-add that). The base /tmp is already a RAM tmpfs, which iceccd uses for scratch.",
+  "process": {
+    "rlimits": [
+      { "type": "RLIMIT_NPROC", "hard": 32768, "soft": 32768 }
+    ]
+  }
+}

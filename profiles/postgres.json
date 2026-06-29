@@ -1,0 +1,14 @@
+{
+  "_comment": "PostgreSQL overlay. Apply with --profile postgres. Arrays APPEND to the base config; EDIT the data bind 'source' to a host path (it must exist). See profiles/README.md.",
+  "_comment_shm": "Postgres needs more shared memory than the OCI default 64MB; give /dev/shm a real size and raise it for many connections / large work_mem.",
+  "_comment_env": "Set POSTGRES_PASSWORD (or POSTGRES_HOST_AUTH_METHOD) in the container's registry 'env' - NOT here, this file is shared. TZ is a convenience.",
+  "process": {
+    "env": ["TZ=UTC"]
+  },
+  "mounts": [
+    { "destination": "/dev/shm", "type": "tmpfs", "source": "tmpfs",
+      "options": ["nosuid", "nodev", "mode=1777", "size=256m"] },
+    { "destination": "/var/lib/postgresql/data", "type": "bind", "source": "/srv/CHANGEME/postgres",
+      "options": ["rbind", "rw"] }
+  ]
+}
