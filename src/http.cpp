@@ -7,9 +7,17 @@
 
 namespace http {
 
+// in-memory sink with a hard cap: get() is only used for manifests/tokens/the
+// /v2/ ping (all small) - never blobs - so bound it to defend against a
+// malicious registry streaming an unbounded body into memory.
+struct StrSink { std::string* body; size_t cap; bool over; };
+
 static size_t to_string_cb(char* ptr, size_t sz, size_t n, void* ud) {
-	static_cast<std::string*>(ud)->append(ptr, sz * n);
-	return sz * n;
+	StrSink* s = static_cast<StrSink*>(ud);
+	size_t add = sz * n;
+	if ( s->body->size() + add > s->cap ) { s->over = true; return 0; }   // returning < requested aborts the transfer
+	s->body->append(ptr, add);
+	return add;
 }
 
 static size_t to_file_cb(char* ptr, size_t sz, size_t n, void* ud) {
@@ -58,14 +66,17 @@ bool get(const std::string& url, const std::vector<std::string>& extra, Response
 	CURL* c = curl_easy_init();
 	if ( !c ) { err = "curl_easy_init failed"; return false; }
 	curl_slist* sl = build_headers(extra);
+	StrSink sink{ &resp.body, 64UL * 1024 * 1024, false };
 
 	curl_easy_setopt(c, CURLOPT_URL, url.c_str());
 	curl_easy_setopt(c, CURLOPT_FOLLOWLOCATION, 1L);
 	curl_easy_setopt(c, CURLOPT_NOPROGRESS, 0L);
 	curl_easy_setopt(c, CURLOPT_XFERINFOFUNCTION, xfer_cb);   // libcurl strips Authorization on cross-origin redirect
 	curl_easy_setopt(c, CURLOPT_MAXREDIRS, 8L);
+	curl_easy_setopt(c, CURLOPT_SSL_VERIFYPEER, 1L);         // explicit (libcurl default, but security-critical)
+	curl_easy_setopt(c, CURLOPT_SSL_VERIFYHOST, 2L);
 	curl_easy_setopt(c, CURLOPT_WRITEFUNCTION, to_string_cb);
-	curl_easy_setopt(c, CURLOPT_WRITEDATA, &resp.body);
+	curl_easy_setopt(c, CURLOPT_WRITEDATA, &sink);
 	curl_easy_setopt(c, CURLOPT_HEADERFUNCTION, header_cb);
 	curl_easy_setopt(c, CURLOPT_HEADERDATA, &resp.headers);
 	curl_easy_setopt(c, CURLOPT_USERAGENT, "docker2uxc/0.2");
@@ -74,7 +85,7 @@ bool get(const std::string& url, const std::vector<std::string>& extra, Response
 
 	CURLcode rc = curl_easy_perform(c);
 	if ( rc == CURLE_OK ) curl_easy_getinfo(c, CURLINFO_RESPONSE_CODE, &resp.status);
-	else err = work::cancelled ? "cancelled" : curl_easy_strerror(rc);
+	else err = work::cancelled ? "cancelled" : ( sink.over ? "response exceeds size limit" : curl_easy_strerror(rc));
 
 	if ( sl ) curl_slist_free_all(sl);
 	curl_easy_cleanup(c);
@@ -93,6 +104,8 @@ bool get_to_file(const std::string& url, const std::vector<std::string>& extra, 
 	curl_easy_setopt(c, CURLOPT_NOPROGRESS, 0L);
 	curl_easy_setopt(c, CURLOPT_XFERINFOFUNCTION, xfer_cb);
 	curl_easy_setopt(c, CURLOPT_MAXREDIRS, 8L);
+	curl_easy_setopt(c, CURLOPT_SSL_VERIFYPEER, 1L);         // explicit (libcurl default, but security-critical)
+	curl_easy_setopt(c, CURLOPT_SSL_VERIFYHOST, 2L);
 	curl_easy_setopt(c, CURLOPT_WRITEFUNCTION, to_file_cb);
 	curl_easy_setopt(c, CURLOPT_WRITEDATA, f);
 	curl_easy_setopt(c, CURLOPT_USERAGENT, "docker2uxc/0.2");

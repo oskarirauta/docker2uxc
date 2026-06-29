@@ -2,6 +2,7 @@
 #include "http.hpp"
 #include "json.hpp"
 #include "logger.hpp"
+#include "work.hpp"
 
 #include <fstream>
 #include <vector>
@@ -35,6 +36,40 @@ static std::string www_attr(const std::string& h, const std::string& key) {
 	p += needle.size();
 	std::string::size_type e = h.find('"', p);
 	return e == std::string::npos ? "" : h.substr(p, e - p);
+}
+
+// host of an "https://host[:port]/..." URL ("" if not https)
+static std::string https_host(const std::string& url) {
+	if ( url.rfind("https://", 0) != 0 ) return "";
+	std::string::size_type s = 8;
+	std::string::size_type e = url.find_first_of("/:?#", s);
+	return url.substr(s, e == std::string::npos ? std::string::npos : e - s);
+}
+
+// Trust the token realm only over https and only when its host is the registry
+// itself (or Docker Hub's well-known auth host) - so a malicious or MITM'd 401
+// cannot redirect our Basic credentials to an attacker (SSRF / credential theft).
+static bool realm_trusted(const std::string& realm, const std::string& apihost) {
+	std::string h = https_host(realm);
+	if ( h.empty()) return false;
+	if ( h == apihost ) return true;
+	if ( apihost == "registry-1.docker.io" && h == "auth.docker.io" ) return true;   // Docker Hub
+	return false;
+}
+
+// a digest must look like "<alg>:<hex>" so it cannot inject into the request URL
+static bool valid_digest(const std::string& d) {
+	std::string::size_type c = d.find(':');
+	if ( c == std::string::npos || c == 0 || c + 1 >= d.size()) return false;
+	for ( std::string::size_type i = 0; i < c; i++ ) {
+		char x = d[i];
+		if ( !(( x >= 'a' && x <= 'z' ) || ( x >= '0' && x <= '9' ) || x == '+' || x == '.' || x == '-' )) return false;
+	}
+	for ( std::string::size_type i = c + 1; i < d.size(); i++ ) {
+		char x = d[i];
+		if ( !(( x >= '0' && x <= '9' ) || ( x >= 'a' && x <= 'f' ) || ( x >= 'A' && x <= 'F' ))) return false;
+	}
+	return true;
 }
 
 // base64 "user:pass" for `reg` from the Docker auths file, or empty
@@ -82,14 +117,20 @@ static bool authenticate(const ImageRef& ref, const std::string& auth_file,
 	std::string realm = www_attr(wa, "realm");
 	std::string service = www_attr(wa, "service");
 	if ( realm.empty()) { err = "registry 401 without a Bearer realm"; return false; }
+	if ( https_host(realm).empty()) { err = "registry realm is not https: " + realm; return false; }
 	std::string scope = "repository:" + ref.repo + ":pull";
 
 	std::string creds = registry_creds(ref.reg, auth_file);
-	if ( !creds.empty()) logger::verbose << "registry: using credentials for " << ref.reg << std::endl;
+	// only hand Basic credentials to a realm we trust (the registry's own host)
+	bool creds_to_realm = !creds.empty() && realm_trusted(realm, ref.apihost);
+	if ( !creds.empty() && !creds_to_realm )
+		logger::verbose << "registry: realm host not trusted for " << ref.reg << "; requesting an anonymous token" << std::endl;
+	else if ( creds_to_realm )
+		logger::verbose << "registry: using credentials for " << ref.reg << std::endl;
 
 	std::string tokurl = realm + "?service=" + service + "&scope=" + scope;
 	std::vector<std::string> th;
-	if ( !creds.empty()) th.push_back("Authorization: Basic " + creds);
+	if ( creds_to_realm ) th.push_back("Authorization: Basic " + creds);
 
 	http::Response tr;
 	if ( !http::get(tokurl, th, tr, err)) return false;
@@ -109,10 +150,12 @@ static bool authenticate(const ImageRef& ref, const std::string& auth_file,
 }
 
 bool fetch_manifest(const ImageRef& ref, const std::string& auth_file, std::string& body, std::string& err) {
+	std::string rd = ref.refdesc();
+	if ( !ref.digest.empty() && !valid_digest(rd)) { err = "invalid manifest digest: " + rd; return false; }   // digest from a (possibly hostile) index
 	std::vector<std::string> headers;
 	if ( !authenticate(ref, auth_file, headers, err)) return false;
 	headers.push_back(ACCEPT_MANIFEST);
-	std::string url = "https://" + ref.apihost + "/v2/" + ref.repo + "/manifests/" + ref.refdesc();
+	std::string url = "https://" + ref.apihost + "/v2/" + ref.repo + "/manifests/" + rd;
 	http::Response r;
 	if ( !http::get(url, headers, r, err)) return false;
 	if ( r.status != 200 ) { err = "manifest HTTP " + std::to_string(r.status); return false; }
@@ -122,10 +165,15 @@ bool fetch_manifest(const ImageRef& ref, const std::string& auth_file, std::stri
 
 bool fetch_blob(const ImageRef& ref, const std::string& digest, const std::string& auth_file,
                 const std::string& outfile, std::string& err) {
-	std::vector<std::string> headers;
-	if ( !authenticate(ref, auth_file, headers, err)) return false;
+	if ( !valid_digest(digest)) { err = "invalid blob digest: " + digest; return false; }
 	std::string url = "https://" + ref.apihost + "/v2/" + ref.repo + "/blobs/" + digest;
-	return http::get_to_file(url, headers, outfile, err);
+	for ( int attempt = 0; attempt < 3; attempt++ ) {       // retry with a fresh token (a long download can outlive one)
+		std::vector<std::string> headers;
+		if ( !authenticate(ref, auth_file, headers, err)) return false;
+		if ( http::get_to_file(url, headers, outfile, err)) return true;
+		if ( work::cancelled ) return false;                // never retry a cancellation
+	}
+	return false;   // err holds the last failure
 }
 
 }
