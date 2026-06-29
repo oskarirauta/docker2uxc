@@ -11,7 +11,10 @@
 #include "manifest.hpp"
 #include "work.hpp"
 #include "archive.hpp"
+#include "extract.hpp"
 #include <sys/utsname.h>
+#include <sys/stat.h>
+#include <unistd.h>
 
 #define D2U_VERSION "0.2.0-dev"
 
@@ -103,11 +106,24 @@ int main(int argc, char** argv) {
 	logger::info << "config:  " << img.config_digest << std::endl;
 	logger::info << "layers:  " << img.layers.size() << std::endl;
 
+	std::string::size_type bs = ref.repo.find_last_of('/');
+	std::string name = (bool)usage["name"] ? usage["name"].value
+	                   : ref.repo.substr(bs == std::string::npos ? 0 : bs + 1);
+	std::string out = (bool)usage["out"] ? usage["out"].value : "./" + name;
+	struct stat ost;
+	if ( stat(out.c_str(), &ost) == 0 && !(bool)usage["force"] ) {
+		logger::error << "docker2uxc: output exists: " << out << " (use --force)" << std::endl;
+		http::global_cleanup(); return 1;
+	}
+
 	work::Dir wd;
 	if ( !wd.ok()) { logger::error << "docker2uxc: cannot create work directory" << std::endl; http::global_cleanup(); return 1; }
 	std::string derr;
+	std::string rootfs = out + "/rootfs";
+	mkdir(out.c_str(), 0755);
+	mkdir(rootfs.c_str(), 0755);
 
-	logger::info << "==> downloading config + " << img.layers.size() << " layers" << std::endl;
+	logger::info << "==> " << out << "  (config + " << img.layers.size() << " layers)" << std::endl;
 	if ( !archive::download_verify(ref, img.config_digest, auth_file, wd.path() + "/config", derr)) {
 		logger::error << "docker2uxc: config: " << derr << std::endl; http::global_cleanup(); return 1;
 	}
@@ -115,14 +131,20 @@ int main(int argc, char** argv) {
 	for ( const auto& L : img.layers ) {
 		++li;
 		if ( work::cancelled ) { logger::error << "docker2uxc: cancelled" << std::endl; http::global_cleanup(); return 1; }
-		logger::verbose << "  layer " << li << "/" << img.layers.size() << "  " << L.digest.substr(0, 19) << ".." << std::endl;
-		if ( !archive::download_verify(ref, L.digest, auth_file, wd.path() + "/layer" + std::to_string(li), derr)) {
+		std::string lf = wd.path() + "/layer" + std::to_string(li);
+		logger::verbose << "  layer " << li << "/" << img.layers.size() << "  download" << std::endl;
+		if ( !archive::download_verify(ref, L.digest, auth_file, lf, derr)) {
 			logger::error << "docker2uxc: layer " << li << ": " << derr << std::endl; http::global_cleanup(); return 1;
 		}
+		logger::verbose << "  layer " << li << "/" << img.layers.size() << "  extract" << std::endl;
+		if ( !extract::layer(lf, rootfs, wd.path() + "/layer.tar", derr)) {
+			logger::error << "docker2uxc: extract layer " << li << ": " << derr << std::endl; http::global_cleanup(); return 1;
+		}
+		unlink(lf.c_str());   // free the compressed blob once extracted
 	}
-	logger::info << "==> all blobs downloaded and sha256-verified" << std::endl;
+	logger::info << "==> rootfs extracted: " << rootfs << " (" << img.layers.size() << " layers)" << std::endl;
 
-	logger::error << "docker2uxc: decompress + secure extract + bundle - next increment" << std::endl;
+	logger::error << "docker2uxc: OCI bundle (config.json) + registration - next increment" << std::endl;
 	http::global_cleanup();
 	return 1;
 }
