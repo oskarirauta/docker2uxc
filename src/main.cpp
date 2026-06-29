@@ -15,6 +15,7 @@
 #include "bundle.hpp"
 #include "reg.hpp"
 #include "dockerfile.hpp"
+#include "emit.hpp"
 #include "json.hpp"
 #include <fstream>
 #include <iterator>
@@ -111,6 +112,29 @@ static int check_updates(const std::string& auth_file) {
 	return 0;
 }
 
+// Fetch a blob into `outfile`, using a content-addressed cache (<cache>/<hex>,
+// the shell's layout) when cache_dir is set. Cache hits are re-verified (unless
+// --no-verify); a fresh download populates the cache. Returns false + err.
+static bool fetch_blob_cached(const ImageRef& ref, const std::string& digest, const std::string& auth_file,
+                              const std::string& outfile, bool verify, const std::string& cache_dir, std::string& err) {
+	std::string hex = digest;
+	std::string::size_type c = hex.find(':');
+	if ( c != std::string::npos ) hex = hex.substr(c + 1);
+	std::string cpath = cache_dir.empty() ? std::string() : ( cache_dir + "/" + hex );
+
+	if ( !cpath.empty()) {                            // cache hit?
+		struct stat st;
+		if ( stat(cpath.c_str(), &st) == 0 && st.st_size > 0 ) {
+			bool good = true;
+			if ( verify ) { std::string g = sha256_file(cpath, err); good = ( !g.empty() && g == hex ); }
+			if ( good && copy_file(cpath, outfile)) { logger::verbose << "  cache hit " << hex << std::endl; return true; }
+		}
+	}
+	if ( !archive::download_verify(ref, digest, auth_file, outfile, err, verify)) return false;
+	if ( !cpath.empty()) { mkdir(cache_dir.c_str(), 0755); copy_file(outfile, cpath); }   // populate cache
+	return true;
+}
+
 int main(int argc, char** argv) {
 
 	usage_t usage = {
@@ -132,10 +156,16 @@ int main(int argc, char** argv) {
 			{ "auth-file",      {             .word = "auth-file",      .desc = "registry credentials (Docker auths JSON)", .flag = usage_t::REQUIRED, .name = "file" }},
 			{ "infra",          {             .word = "infra",          .desc = "register as a member of shared netns NAME", .flag = usage_t::REQUIRED, .name = "netns" }},
 			{ "caps",           {             .word = "caps",           .desc = "capability set: permissive | minimal",      .flag = usage_t::REQUIRED, .name = "set" }},
+			{ "profile",        {             .word = "profile",        .desc = "apply profiles/<NAME>.json overlay",        .flag = usage_t::REQUIRED, .name = "name" }},
 			{ "network",        {             .word = "network",        .desc = "host | isolated (default host)",            .flag = usage_t::REQUIRED, .name = "mode" }},
+			{ "emit-netconfig", {             .word = "emit-netconfig", .desc = "write an /etc/config/network veth/infra snippet" }},
+			{ "net-bridge",     {             .word = "net-bridge",     .desc = "bridge for --emit-netconfig (default br-lan)", .flag = usage_t::REQUIRED, .name = "br" }},
+			{ "emit-keeper",    {             .word = "emit-keeper",    .desc = "write <name>.init: a procd keeper service" }},
 			{ "privileged",     {             .word = "privileged",     .desc = "process.noNewPrivileges = false" }},
 			{ "resolv-conf",    {             .word = "resolv-conf",    .desc = "bind-mount the host /etc/resolv.conf" }},
 			{ "no-accounting",  {             .word = "no-accounting",  .desc = "omit the memory+pids linux.resources block" }},
+			{ "no-verify",      {             .word = "no-verify",      .desc = "skip sha256 verification of downloaded blobs" }},
+			{ "cache",          {             .word = "cache",          .desc = "blob cache directory (default /tmp/docker2uxc-cache)", .flag = usage_t::REQUIRED, .name = "dir" }},
 			{ "rw-overlay",     {             .word = "rw-overlay",     .desc = "tune config for a writable overlay" }},
 			{ "autostart",      {             .word = "autostart",      .desc = "register the container to start on boot" }},
 			{ "no-register",    {             .word = "no-register",    .desc = "build the bundle only; do not register with uxcd" }},
@@ -255,9 +285,13 @@ int main(int argc, char** argv) {
 	mkdir(out.c_str(), 0755);
 	mkdir(rootfs.c_str(), 0755);
 
+	bool verify = !(bool)usage["no-verify"];
+	const char* cenv = getenv("DOCKER2UXC_CACHE");
+	std::string cache_dir = (bool)usage["cache"] ? usage["cache"].value : ( cenv ? cenv : "/tmp/docker2uxc-cache" );
+
 	logger::info << "==> " << out << "  (config + " << img.layers.size() << " layers)" << std::endl;
 	std::string cfgblob = wd.path() + "/config";
-	if ( !archive::download_verify(ref, img.config_digest, auth_file, cfgblob, derr)) {
+	if ( !fetch_blob_cached(ref, img.config_digest, auth_file, cfgblob, verify, cache_dir, derr)) {
 		logger::error << "docker2uxc: config: " << derr << std::endl; http::global_cleanup(); return 1;
 	}
 	int li = 0;
@@ -266,7 +300,7 @@ int main(int argc, char** argv) {
 		if ( work::cancelled ) { logger::error << "docker2uxc: cancelled" << std::endl; http::global_cleanup(); return 1; }
 		std::string lf = wd.path() + "/layer" + std::to_string(li);
 		logger::verbose << "  layer " << li << "/" << img.layers.size() << "  download" << std::endl;
-		if ( !archive::download_verify(ref, L.digest, auth_file, lf, derr)) {
+		if ( !fetch_blob_cached(ref, L.digest, auth_file, lf, verify, cache_dir, derr)) {
 			logger::error << "docker2uxc: layer " << li << ": " << derr << std::endl; http::global_cleanup(); return 1;
 		}
 		logger::verbose << "  layer " << li << "/" << img.layers.size() << "  extract" << std::endl;
@@ -300,14 +334,53 @@ int main(int argc, char** argv) {
 	if ( !bundle::write_config(cfgblob, rootfs, bo, out + "/config.json", derr)) {
 		logger::error << "docker2uxc: config.json: " << derr << std::endl; http::global_cleanup(); return 1;
 	}
+
+	// profile overlay: deep-merge profiles/<name>.json onto config.json
+	if ( (bool)usage["profile"] ) {
+		std::string pname = usage["profile"].value;
+		logger::info << "==> applying profile: " << pname << std::endl;
+		if ( !emit::profile(out + "/config.json", emit::profile_dir(), pname, derr)) {
+			logger::error << "docker2uxc: " << derr << std::endl; http::global_cleanup(); return 1;
+		}
+	}
+
 	copy_file(cfgblob, out + "/image-config.json");
 	write_file_str(out + "/manifest.json", img.manifest_json);
+
+	char abuf[4096];
+	std::string abs_out = realpath(out.c_str(), abuf) ? std::string(abuf) : out;
+
+	// optional bundle-side emitters, then the always-written notes + bind warning
+	bool emit_net = bo.network_isolated || (bool)usage["emit-netconfig"];
+	if ( emit_net ) {
+		std::string bridge = (bool)usage["net-bridge"] ? usage["net-bridge"].value : "br-lan";
+		if ( !emit::netconfig(out, name, bridge, derr)) { logger::error << "docker2uxc: netconfig: " << derr << std::endl; http::global_cleanup(); return 1; }
+	}
+	if ( (bool)usage["emit-keeper"] ) {
+		if ( !emit::keeper(out, name, abs_out, derr)) { logger::error << "docker2uxc: keeper: " << derr << std::endl; http::global_cleanup(); return 1; }
+	}
+	{
+		emit::NotesInfo ni;
+		ni.out               = out;
+		ni.name              = name;
+		ni.version           = D2U_VERSION;
+		ni.source            = ref.reg + "/" + ref.repo + ":" + ref.tag;
+		ni.arch              = arch;
+		ni.config_digest     = img.config_digest;
+		ni.image_config_path = out + "/image-config.json";
+		ni.config_json_path  = out + "/config.json";
+		ni.abs_out           = abs_out;
+		ni.network           = bo.network_isolated ? "isolated" : "host";
+		ni.rw_overlay        = bo.rw_overlay;
+		ni.emit_keeper       = (bool)usage["emit-keeper"];
+		std::string nerr;
+		if ( !emit::notes(ni, nerr)) logger::error << "docker2uxc: notes: " << nerr << std::endl;   // non-fatal
+	}
+	emit::warn_missing_binds(out + "/config.json");
 	logger::info << "==> bundle ready: " << out << std::endl;
 
 	// provenance + registration (so uxcd can detect updates + adopt it)
 	if ( !(bool)usage["no-register"] ) {
-		char abuf[4096];
-		std::string abs_out = realpath(out.c_str(), abuf) ? std::string(abuf) : out;
 		const char* ud = getenv("DOCKER2UXC_UXCDIR");
 		std::string uxc_dir = ud ? ud : "/etc/uxc";
 		std::string infra = (bool)usage["infra"] ? usage["infra"].value : "";

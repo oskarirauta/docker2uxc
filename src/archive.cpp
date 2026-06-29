@@ -5,8 +5,10 @@
 namespace archive {
 
 bool download_verify(const ImageRef& ref, const std::string& digest, const std::string& auth_file,
-                     const std::string& outfile, std::string& err) {
+                     const std::string& outfile, std::string& err, bool verify) {
 	if ( !registry::fetch_blob(ref, digest, auth_file, outfile, err)) return false;
+
+	if ( !verify ) return true;   // --no-verify
 
 	std::string got = sha256_file(outfile, err);
 	if ( got.empty()) return false;
