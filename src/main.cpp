@@ -14,6 +14,7 @@
 #include "extract.hpp"
 #include "bundle.hpp"
 #include "reg.hpp"
+#include "dockerfile.hpp"
 #include "json.hpp"
 #include <fstream>
 #include <iterator>
@@ -28,7 +29,9 @@
 #define D2U_VERSION "0.2.0-dev"
 
 static int rm_one(const char* p, const struct stat*, int, struct FTW*) { remove(p); return 0; }
-static void rm_rf(const std::string& p) { nftw(p.c_str(), rm_one, 16, FTW_DEPTH | FTW_PHYS); }
+// FTW_MOUNT: never cross a mount point - a stale Dockerfile-build bind (e.g. an
+// orphaned /proc after a SIGKILL) is left in place rather than recursed into.
+static void rm_rf(const std::string& p) { nftw(p.c_str(), rm_one, 16, FTW_DEPTH | FTW_PHYS | FTW_MOUNT); }
 
 static bool copy_file(const std::string& src, const std::string& dst) {
 	std::ifstream i(src, std::ios::binary);
@@ -124,6 +127,8 @@ int main(int argc, char** argv) {
 			{ "out",            { .key = "o", .word = "out",            .desc = "output bundle directory",                  .flag = usage_t::REQUIRED, .name = "dir" }},
 			{ "name",           { .key = "n", .word = "name",           .desc = "container name",                            .flag = usage_t::REQUIRED, .name = "name" }},
 			{ "arch",           { .key = "a", .word = "arch",           .desc = "target architecture (default: host)",      .flag = usage_t::REQUIRED, .name = "arch" }},
+			{ "dockerfile",     { .key = "d", .word = "dockerfile",     .desc = "build from a Dockerfile (FROM = base image)", .flag = usage_t::REQUIRED, .name = "file" }},
+			{ "context",        {             .word = "context",        .desc = "build context for COPY/ADD (default: Dockerfile dir)", .flag = usage_t::REQUIRED, .name = "dir" }},
 			{ "auth-file",      {             .word = "auth-file",      .desc = "registry credentials (Docker auths JSON)", .flag = usage_t::REQUIRED, .name = "file" }},
 			{ "infra",          {             .word = "infra",          .desc = "register as a member of shared netns NAME", .flag = usage_t::REQUIRED, .name = "netns" }},
 			{ "caps",           {             .word = "caps",           .desc = "capability set: permissive | minimal",      .flag = usage_t::REQUIRED, .name = "set" }},
@@ -159,13 +164,37 @@ int main(int argc, char** argv) {
 	}
 
 	std::vector<std::string> rest = usage.remainder();
-	if ( rest.empty()) {
-		logger::error << "docker2uxc: missing <image-ref>" << std::endl;
-		std::cout << usage << std::endl;
-		return 1;
+
+	// In Dockerfile mode the base image comes from FROM, not a positional ref.
+	bool df_mode = (bool)usage["dockerfile"];
+	std::string df_path, df_ctx, ref_str;
+	if ( df_mode ) {
+		df_path = usage["dockerfile"].value;
+		std::string::size_type sl = df_path.find_last_of('/');
+		df_ctx = (bool)usage["context"] ? usage["context"].value
+		         : ( sl == std::string::npos ? std::string(".") : ( sl == 0 ? std::string("/") : df_path.substr(0, sl)));
+		struct stat dst;
+		if ( stat(df_path.c_str(), &dst) != 0 ) {
+			logger::error << "docker2uxc: dockerfile not found: " << df_path << std::endl;
+			http::global_cleanup(); return 1;
+		}
+		std::string ferr;
+		ref_str = dockerfile::parse_from(df_path, ferr);
+		if ( ref_str.empty()) {
+			logger::error << "docker2uxc: " << ferr << std::endl;
+			http::global_cleanup(); return 1;
+		}
+		logger::info << "dockerfile: " << df_path << "  (context: " << df_ctx << ")" << std::endl;
+	} else {
+		if ( rest.empty()) {
+			logger::error << "docker2uxc: missing <image-ref>" << std::endl;
+			std::cout << usage << std::endl;
+			http::global_cleanup(); return 1;
+		}
+		ref_str = rest[0];
 	}
 
-	ImageRef ref = parse_ref(rest[0]);
+	ImageRef ref = parse_ref(ref_str);
 	logger::info << "image:   " << ref.reg << "/" << ref.repo
 	             << (ref.digest.empty() ? (":" + ref.tag) : ("@" + ref.digest)) << std::endl;
 	logger::verbose << "apihost: " << ref.apihost << "  refdesc: " << ref.refdesc() << std::endl;
@@ -201,8 +230,15 @@ int main(int argc, char** argv) {
 	logger::info << "layers:  " << img.layers.size() << std::endl;
 
 	std::string::size_type bs = ref.repo.find_last_of('/');
-	std::string name = (bool)usage["name"] ? usage["name"].value
-	                   : ref.repo.substr(bs == std::string::npos ? 0 : bs + 1);
+	std::string name;
+	if ( (bool)usage["name"] ) name = usage["name"].value;
+	else if ( df_mode ) {   // default to the build-context dir name (the base ref would be wrong)
+		char cbuf[4096];
+		std::string ctx_abs = realpath(df_ctx.c_str(), cbuf) ? std::string(cbuf) : df_ctx;
+		std::string::size_type cs = ctx_abs.find_last_of('/');
+		name = ( cs == std::string::npos ) ? ctx_abs : ctx_abs.substr(cs + 1);
+		if ( name.empty()) name = "container";
+	} else name = ref.repo.substr(bs == std::string::npos ? 0 : bs + 1);
 	std::string out = (bool)usage["out"] ? usage["out"].value : "./" + name;
 	struct stat ost;
 	bool exists = ( stat(out.c_str(), &ost) == 0 );
@@ -241,6 +277,17 @@ int main(int argc, char** argv) {
 	}
 	logger::info << "==> rootfs extracted (" << img.layers.size() << " layers)" << std::endl;
 
+	// Dockerfile build: apply RUN/COPY/ENV/... on top of the extracted base rootfs.
+	// This mutates cfgblob in place, so the bundle config + image-config.json below
+	// reflect the build's ENV/WORKDIR/USER/CMD/ENTRYPOINT.
+	if ( df_mode ) {
+		logger::info << "==> dockerfile build" << std::endl;
+		if ( !dockerfile::apply(df_path, df_ctx, rootfs, cfgblob, derr)) {
+			logger::error << "docker2uxc: dockerfile: " << derr << std::endl; http::global_cleanup(); return 1;
+		}
+		logger::info << "==> dockerfile build complete" << std::endl;
+	}
+
 	// OCI bundle config.json + the reference copies
 	bundle::Opts bo;
 	bo.name             = name;
@@ -264,7 +311,10 @@ int main(int argc, char** argv) {
 		const char* ud = getenv("DOCKER2UXC_UXCDIR");
 		std::string uxc_dir = ud ? ud : "/etc/uxc";
 		std::string infra = (bool)usage["infra"] ? usage["infra"].value : "";
-		if ( !reg::register_container(uxc_dir, name, abs_out, rest[0], img.provenance_digest, infra, (bool)usage["autostart"], derr)) {
+		// a Dockerfile FROM is the base image, not "the image" - no update provenance
+		std::string prov_image  = df_mode ? std::string() : ref_str;
+		std::string prov_digest = df_mode ? std::string() : img.provenance_digest;
+		if ( !reg::register_container(uxc_dir, name, abs_out, prov_image, prov_digest, infra, (bool)usage["autostart"], derr)) {
 			logger::error << "docker2uxc: register: " << derr << std::endl; http::global_cleanup(); return 1;
 		}
 		logger::info << "==> registered: " << uxc_dir << "/" << name << ".json" << std::endl;
