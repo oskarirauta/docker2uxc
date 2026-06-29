@@ -9,7 +9,7 @@
 #include <cerrno>
 #include <unistd.h>
 #include <fcntl.h>
-#include <ftw.h>
+#include <dirent.h>
 #include <sys/stat.h>
 
 #include <zlib.h>
@@ -142,35 +142,63 @@ static bool sanitize(const std::string& name, std::vector<std::string>& comps) {
 	return !comps.empty();
 }
 
-static int rm_entry(const char* p, const struct stat*, int, struct FTW*) { remove(p); return 0; }
-static void rm_rf(const std::string& path) { nftw(path.c_str(), rm_entry, 16, FTW_DEPTH | FTW_PHYS); }
+// All path resolution below is by directory fd with O_NOFOLLOW on EVERY
+// component (parents included), so no symlink is ever traversed - this closes
+// the TOCTOU window that a string path + final-only O_NOFOLLOW would leave open.
 
-// Ensure the parent dirs of `comps` exist as REAL dirs under rootfs, replacing
-// any intervening symlink (or non-dir) with a fresh dir so we never write
-// THROUGH a symlink out of rootfs. Sets `full` to the final entry path.
-static bool secure_parents(const std::string& rootfs, const std::vector<std::string>& comps, std::string& full) {
-	std::string cur = rootfs;
+// Open (creating as needed) the parent dir of `comps` under root_fd. Each step
+// is O_NOFOLLOW; a symlink/non-dir in the way is replaced by a real dir. Returns
+// the parent fd (caller closes) or -1; sets `base` to the final component.
+static int open_parent(int root_fd, const std::vector<std::string>& comps, std::string& base) {
+	int dir = openat(root_fd, ".", O_RDONLY | O_DIRECTORY);   // a fresh fd at rootfs
+	if ( dir < 0 ) return -1;
 	for ( size_t i = 0; i + 1 < comps.size(); i++ ) {
-		cur += "/" + comps[i];
-		struct stat st;
-		if ( lstat(cur.c_str(), &st) == 0 ) {
-			if ( !S_ISDIR(st.st_mode)) {            // symlink or file where a dir must be
-				if ( S_ISLNK(st.st_mode) || !S_ISDIR(st.st_mode)) {
-					if ( remove(cur.c_str()) != 0 ) { rm_rf(cur); }
-				}
-				if ( mkdir(cur.c_str(), 0755) != 0 && errno != EEXIST ) return false;
-			}
-		} else {
-			if ( mkdir(cur.c_str(), 0755) != 0 && errno != EEXIST ) return false;
+		const char* c = comps[i].c_str();
+		int next = openat(dir, c, O_RDONLY | O_DIRECTORY | O_NOFOLLOW);
+		if ( next < 0 ) {                              // missing, or a symlink/file in the way
+			unlinkat(dir, c, 0);                       // drop a symlink/file (ENOENT ignored)
+			if ( mkdirat(dir, c, 0755) != 0 && errno != EEXIST ) { close(dir); return -1; }
+			next = openat(dir, c, O_RDONLY | O_DIRECTORY | O_NOFOLLOW);
+			if ( next < 0 ) { close(dir); return -1; }
 		}
+		close(dir);
+		dir = next;
 	}
-	full = cur + "/" + comps.back();
-	return true;
+	base = comps.back();
+	return dir;
 }
 
-static bool write_file(const std::string& full, FILE* tar, unsigned long long size, mode_t mode) {
-	unlink(full.c_str());   // drop any existing symlink/file (overlay: layer replaces)
-	int fd = open(full.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_NOFOLLOW, mode & 0777);
+// fd-relative recursive remove (whiteouts) - never follows a symlink
+static void rm_at(int pfd, const char* name) {
+	if ( unlinkat(pfd, name, 0) == 0 ) return;         // file/symlink
+	int dfd = openat(pfd, name, O_RDONLY | O_DIRECTORY | O_NOFOLLOW);
+	if ( dfd < 0 ) { unlinkat(pfd, name, 0); return; }
+	if ( DIR* d = fdopendir(dfd)) {
+		for ( struct dirent* e; ( e = readdir(d)); ) {
+			if ( !std::strcmp(e->d_name, ".") || !std::strcmp(e->d_name, "..")) continue;
+			rm_at(dfd, e->d_name);
+		}
+		closedir(d);                                   // also closes dfd
+	} else close(dfd);
+	unlinkat(pfd, name, AT_REMOVEDIR);
+}
+
+// empty a directory given its fd (opaque whiteout)
+static void clear_dir(int dfd) {
+	int c = dup(dfd);
+	if ( c < 0 ) return;
+	DIR* d = fdopendir(c);
+	if ( !d ) { close(c); return; }
+	for ( struct dirent* e; ( e = readdir(d)); ) {
+		if ( !std::strcmp(e->d_name, ".") || !std::strcmp(e->d_name, "..")) continue;
+		rm_at(dfd, e->d_name);
+	}
+	closedir(d);
+}
+
+static bool write_file_at(int pfd, const std::string& base, FILE* tar, unsigned long long size, mode_t mode) {
+	unlinkat(pfd, base.c_str(), 0);   // drop any existing symlink/file (overlay: layer replaces)
+	int fd = openat(pfd, base.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_NOFOLLOW, mode & 0777);
 	if ( fd < 0 ) return false;
 	unsigned long long left = size;
 	char buf[65536];
@@ -183,8 +211,7 @@ static bool write_file(const std::string& full, FILE* tar, unsigned long long si
 		left -= n;
 	}
 	close(fd);
-	// skip padding to the 512-byte block boundary
-	unsigned long long pad = (512 - (size % 512)) % 512;
+	unsigned long long pad = (512 - (size % 512)) % 512;   // skip to the 512-byte block boundary
 	if ( pad ) std::fseek(tar, (long)pad, SEEK_CUR);
 	return ok;
 }
@@ -218,6 +245,8 @@ static std::string read_data(FILE* f, unsigned long long size) {
 static bool extract_tar(const std::string& tarfile, const std::string& rootfs, std::string& err) {
 	FILE* f = std::fopen(tarfile.c_str(), "rb");
 	if ( !f ) { err = "open tar " + tarfile; return false; }
+	int root_fd = open(rootfs.c_str(), O_RDONLY | O_DIRECTORY);   // base for all O_NOFOLLOW openat() resolution
+	if ( root_fd < 0 ) { std::fclose(f); err = "open rootfs " + rootfs; return false; }
 
 	std::string pend_name, pend_link;   // from GNU L/K or PAX path/linkpath
 	char hdr[512];
@@ -253,54 +282,58 @@ static bool extract_tar(const std::string& tarfile, const std::string& rootfs, s
 		std::vector<std::string> comps;
 		if ( !sanitize(name, comps)) { if ( blocks ) std::fseek(f, (long)(blocks * 512), SEEK_CUR); continue; }
 
-		// whiteouts (operate relative to the entry's directory in rootfs)
+		// whiteouts (operate relative to the entry's directory, by fd)
 		std::string base = comps.back();
 		if ( base.rfind(".wh.", 0) == 0 ) {
-			std::string dir = rootfs;
-			for ( size_t i = 0; i + 1 < comps.size(); i++ ) dir += "/" + comps[i];
-			if ( base == ".wh..wh..opq" ) {
-				// opaque: remove the dir's existing contents
-				rm_rf(dir);   // remove + recreate (its own layer entry, if any, re-adds it)
-				mkdir(dir.c_str(), 0755);
-			} else {
-				rm_rf(dir + "/" + base.substr(4));   // remove the whited-out target
+			std::string wb;
+			int pfd = open_parent(root_fd, comps, wb);   // pfd = the entry's directory
+			if ( pfd >= 0 ) {
+				if ( base == ".wh..wh..opq" ) clear_dir(pfd);          // opaque: empty the dir
+				else rm_at(pfd, base.substr(4).c_str());               // remove the whited-out target
+				close(pfd);
 			}
 			if ( blocks ) std::fseek(f, (long)(blocks * 512), SEEK_CUR);
 			continue;
 		}
 
-		std::string full;
-		if ( !secure_parents(rootfs, comps, full)) { err = "cannot create path for " + name; ok = false; break; }
+		std::string bn;
+		int pfd = open_parent(root_fd, comps, bn);
+		if ( pfd < 0 ) { err = "cannot create path for " + name; ok = false; break; }
 
 		switch ( type ) {
 			case '5':                                  // directory
-				mkdir(full.c_str(), (mode_t)(octal(hdr + 100, 8) & 0777) | 0700);
+				mkdirat(pfd, bn.c_str(), (mode_t)(octal(hdr + 100, 8) & 0777) | 0700);
 				break;
-			case '2':                                  // symlink (target NOT followed at write time)
-				unlink(full.c_str());
-				if ( symlink(link.c_str(), full.c_str()) != 0 ) { /* tolerate */ }
+			case '2':                                  // symlink (target stored as-is, never followed by us)
+				unlinkat(pfd, bn.c_str(), 0);
+				if ( symlinkat(link.c_str(), pfd, bn.c_str()) != 0 ) { /* tolerate */ }
 				break;
-			case '1': {                                // hardlink (to another already-extracted entry)
+			case '1': {                                // hardlink to another already-extracted entry
 				std::vector<std::string> lc;
 				if ( sanitize(link, lc)) {
-					std::string lf; std::string lroot = rootfs;
-					for ( size_t i = 0; i + 1 < lc.size(); i++ ) lroot += "/" + lc[i];
-					lf = lroot + "/" + lc.back();
-					unlink(full.c_str());
-					if ( ::link(lf.c_str(), full.c_str()) != 0 ) { /* tolerate */ }
+					std::string lbn;
+					int lpfd = open_parent(root_fd, lc, lbn);
+					if ( lpfd >= 0 ) {
+						unlinkat(pfd, bn.c_str(), 0);
+						if ( linkat(lpfd, lbn.c_str(), pfd, bn.c_str(), 0) != 0 ) { /* tolerate */ }
+						close(lpfd);
+					}
 				}
 				break;
 			}
 			case '0': case '\0': case '7':             // regular file
-				if ( !write_file(full, f, size, (mode_t)octal(hdr + 100, 8))) { err = "write " + name; ok = false; }
-				continue;                              // write_file consumed the data + padding
+				if ( !write_file_at(pfd, bn, f, size, (mode_t)octal(hdr + 100, 8))) { err = "write " + name; ok = false; }
+				close(pfd);
+				continue;                              // write_file_at consumed the data + padding
 			default:                                   // char/block/fifo: skip data, don't create device nodes
 				break;
 		}
+		close(pfd);
 		if ( blocks ) std::fseek(f, (long)(blocks * 512), SEEK_CUR);
 		if ( !ok ) break;
 	}
 
+	close(root_fd);
 	std::fclose(f);
 	return ok;
 }
