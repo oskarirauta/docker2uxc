@@ -14,7 +14,11 @@
 #include "extract.hpp"
 #include "bundle.hpp"
 #include "reg.hpp"
+#include "json.hpp"
 #include <fstream>
+#include <iterator>
+#include <algorithm>
+#include <dirent.h>
 #include <sys/utsname.h>
 #include <sys/stat.h>
 #include <unistd.h>
@@ -51,6 +55,57 @@ static std::string host_arch() {
 	if ( m == "armv6l" )  return "arm/v6";
 	if ( m == "i386" || m == "i686" ) return "386";
 	return m;
+}
+
+static std::string uxc_registry_dir() {
+	const char* ud = getenv("DOCKER2UXC_UXCDIR");
+	return ud ? ud : "/etc/uxc";
+}
+
+// --check-updates: for each registered container that carries image+digest,
+// re-resolve the upstream digest and print one line per container:
+//   <name>\t<current|update|error>\t<digest>
+// Mirrors the shell exactly (uxcd parses this), but resolves in-process - no
+// per-container self-exec of --resolve-digest.
+static int check_updates(const std::string& auth_file) {
+	std::string dir = uxc_registry_dir();
+	DIR* d = opendir(dir.c_str());
+	if ( !d ) return 0;   // no registry yet -> nothing to report (shell: empty glob)
+
+	std::vector<std::string> names;
+	for ( struct dirent* e; (e = readdir(d)) != nullptr; ) {
+		std::string fn = e->d_name;
+		if ( fn.size() <= 5 || fn.substr(fn.size() - 5) != ".json" ) continue;
+		names.push_back(fn.substr(0, fn.size() - 5));
+	}
+	closedir(d);
+	std::sort(names.begin(), names.end());   // match the shell's sorted glob order
+
+	for ( const std::string& n : names ) {
+		if ( work::cancelled ) break;
+		std::ifstream f(dir + "/" + n + ".json");
+		if ( !f ) continue;
+		std::string s((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+		std::string image, old;
+		try {
+			JSON j = JSON::parse(s);
+			if ( j.type() != JSON::TYPE::OBJECT ) continue;
+			if ( j.contains("image"))  image = j["image"].to_string();
+			if ( j.contains("digest")) old   = j["digest"].to_string();
+		} catch ( ... ) { continue; }
+		if ( image.empty() || old.empty()) continue;   // only registry-pulled images
+
+		ImageRef r = parse_ref(image);
+		std::string body, err, neu;
+		if ( registry::fetch_manifest(r, auth_file, body, err))
+			neu = "sha256:" + sha256_hex(body);
+
+		if      ( neu.empty()) std::cout << n << "\terror\t"          << "\n";
+		else if ( neu == old ) std::cout << n << "\tcurrent\t" << neu << "\n";
+		else                   std::cout << n << "\tupdate\t"  << neu << "\n";
+		std::cout.flush();
+	}
+	return 0;
 }
 
 int main(int argc, char** argv) {
@@ -92,6 +147,17 @@ int main(int argc, char** argv) {
 	if ( (bool)usage["help"] )    { std::cout << usage << "\n" << usage.help() << std::endl; return 0; }
 	if ( (bool)usage["verbose"] ) logger::loglevel(logger::debug);
 
+	std::string auth_file = (bool)usage["auth-file"] ? usage["auth-file"].value : "/etc/uxcd/auth.json";
+	http::global_init();
+	work::install_signal_handlers();
+
+	// --check-updates: no positional ref required; loop the registry and report.
+	if ( (bool)usage["check-updates"] ) {
+		int rc = check_updates(auth_file);
+		http::global_cleanup();
+		return rc;
+	}
+
 	std::vector<std::string> rest = usage.remainder();
 	if ( rest.empty()) {
 		logger::error << "docker2uxc: missing <image-ref>" << std::endl;
@@ -103,10 +169,6 @@ int main(int argc, char** argv) {
 	logger::info << "image:   " << ref.reg << "/" << ref.repo
 	             << (ref.digest.empty() ? (":" + ref.tag) : ("@" + ref.digest)) << std::endl;
 	logger::verbose << "apihost: " << ref.apihost << "  refdesc: " << ref.refdesc() << std::endl;
-
-	std::string auth_file = (bool)usage["auth-file"] ? usage["auth-file"].value : "/etc/uxcd/auth.json";
-	http::global_init();
-	work::install_signal_handlers();
 
 	// --resolve-digest: print sha256 of the resolved manifest (uxcd's update check)
 	if ( (bool)usage["resolve-digest"] ) {
