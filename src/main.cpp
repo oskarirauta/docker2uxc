@@ -6,6 +6,8 @@
 #include "logger.hpp"
 #include "ref.hpp"
 #include "http.hpp"
+#include "registry.hpp"
+#include "sha256.hpp"
 
 #define D2U_VERSION "0.2.0-dev"
 
@@ -51,20 +53,23 @@ int main(int argc, char** argv) {
 	             << (ref.digest.empty() ? (":" + ref.tag) : ("@" + ref.digest)) << std::endl;
 	logger::verbose << "apihost: " << ref.apihost << "  refdesc: " << ref.refdesc() << std::endl;
 
-	// phase-1 smoke test: http module against the registry v2 ping (auth flow next)
+	std::string auth_file = (bool)usage["auth-file"] ? usage["auth-file"].value : "/etc/uxcd/auth.json";
 	http::global_init();
-	http::Response resp;
-	std::string err;
-	std::string url = "https://" + ref.apihost + "/v2/";
-	if ( !http::get(url, {}, resp, err)) {
-		logger::error << "docker2uxc: http error: " << err << std::endl;
+
+	// --resolve-digest: print sha256 of the resolved manifest (uxcd's update check)
+	if ( (bool)usage["resolve-digest"] ) {
+		std::string body, err;
+		if ( !registry::fetch_manifest(ref, auth_file, body, err)) {
+			logger::error << "docker2uxc: " << err << std::endl;
+			http::global_cleanup();
+			return 1;
+		}
+		std::cout << "sha256:" << sha256_hex(body) << std::endl;   // stdout = just the digest
 		http::global_cleanup();
-		return 1;
+		return 0;
 	}
-	logger::info << "GET " << url << " -> HTTP " << resp.status << std::endl;
-	std::string wa = resp.header("www-authenticate");
-	if ( !wa.empty()) logger::info << "  WWW-Authenticate: " << wa << std::endl;
+
+	logger::error << "docker2uxc: pull/build not wired yet (next increment)" << std::endl;
 	http::global_cleanup();
-	// next: registry token/auth (parse WWW-Authenticate) -> manifest -> --resolve-digest
-	return 0;
+	return 1;
 }
