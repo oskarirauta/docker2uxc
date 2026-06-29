@@ -7,3 +7,5 @@ out-*/
 # generated bundles
 /frigate/
 /alpine/
+objs/
+/docker2uxc

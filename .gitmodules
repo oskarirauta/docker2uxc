@@ -1,0 +1,12 @@
+[submodule "json_cpp"]
+	path = json_cpp
+	url = https://github.com/oskarirauta/json_cpp.git
+[submodule "common_cpp"]
+	path = common_cpp
+	url = https://github.com/oskarirauta/common_cpp.git
+[submodule "logger_cpp"]
+	path = logger_cpp
+	url = https://github.com/oskarirauta/logger_cpp.git
+[submodule "usage_cpp"]
+	path = usage_cpp
+	url = https://github.com/oskarirauta/usage_cpp.git
