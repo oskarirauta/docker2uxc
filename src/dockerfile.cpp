@@ -97,7 +97,12 @@ int wait_child(pid_t pid) {
 		pid_t r = waitpid(pid, &st, 0);
 		if ( r == pid ) return st;
 		if ( r < 0 && errno == EINTR ) {
-			if ( work::cancelled ) { kill(-pid, SIGKILL); waitpid(pid, &st, 0); return -2; }
+			if ( work::cancelled ) {
+				kill(-pid, SIGKILL);   // the whole group (RUN may have spawned helpers)
+				kill(pid, SIGKILL);    // and the child directly, in case the pgid race left it elsewhere
+				while ( waitpid(pid, &st, 0) < 0 && errno == EINTR ) {}   // reap (retry EINTR) - no zombie
+				return -2;
+			}
 			continue;
 		}
 		if ( r < 0 ) return -1;

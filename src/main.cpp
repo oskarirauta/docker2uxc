@@ -117,21 +117,45 @@ static int check_updates(const std::string& auth_file) {
 // --no-verify); a fresh download populates the cache. Returns false + err.
 static bool fetch_blob_cached(const ImageRef& ref, const std::string& digest, const std::string& auth_file,
                               const std::string& outfile, bool verify, const std::string& cache_dir, std::string& err) {
+	if ( cache_dir.empty())                                  // caching off: straight to the work file
+		return archive::download_verify(ref, digest, auth_file, outfile, err, verify);
+
 	std::string hex = digest;
 	std::string::size_type c = hex.find(':');
 	if ( c != std::string::npos ) hex = hex.substr(c + 1);
-	std::string cpath = cache_dir.empty() ? std::string() : ( cache_dir + "/" + hex );
+	std::string cpath = cache_dir + "/" + hex;
 
-	if ( !cpath.empty()) {                            // cache hit?
-		struct stat st;
-		if ( stat(cpath.c_str(), &st) == 0 && st.st_size > 0 ) {
-			bool good = true;
-			if ( verify ) { std::string g = sha256_file(cpath, err); good = ( !g.empty() && g == hex ); }
-			if ( good && copy_file(cpath, outfile)) { logger::verbose << "  cache hit " << hex << std::endl; return true; }
+	// place the cache blob at the work path as a hardlink (zero-copy); fall back
+	// to a copy across filesystems. The caller may unlink/overwrite the work path
+	// freely afterwards - the cache inode survives.
+	auto place = [&]() -> bool {
+		unlink(outfile.c_str());
+		if ( link(cpath.c_str(), outfile.c_str()) == 0 ) return true;
+		return copy_file(cpath, outfile);
+	};
+
+	struct stat st;
+	if ( stat(cpath.c_str(), &st) == 0 && st.st_size > 0 ) {       // cache hit
+		bool good = !verify;
+		if ( verify ) { std::string g = sha256_file(cpath, err); good = ( !g.empty() && g == hex ); }
+		if ( good ) {
+			if ( place()) { logger::verbose << "  cache hit " << hex << std::endl; return true; }
+			err = "cannot place cached blob " + hex; return false;
 		}
+		unlink(cpath.c_str());      // corrupt / mismatched cache entry: drop and re-fetch
 	}
-	if ( !archive::download_verify(ref, digest, auth_file, outfile, err, verify)) return false;
-	if ( !cpath.empty()) { mkdir(cache_dir.c_str(), 0755); copy_file(outfile, cpath); }   // populate cache
+
+	// miss: download (+verify) into a sibling .part, then publish it atomically
+	mkdir(cache_dir.c_str(), 0755);
+	std::string part = cpath + ".part";
+	if ( !archive::download_verify(ref, digest, auth_file, part, err, verify)) { unlink(part.c_str()); return false; }
+	if ( rename(part.c_str(), cpath.c_str()) != 0 ) {             // unexpected (siblings): use the .part directly
+		bool okc = copy_file(part, outfile);
+		unlink(part.c_str());
+		if ( !okc ) { err = "cannot place blob " + hex; return false; }
+		return true;
+	}
+	if ( !place()) { err = "cannot place cached blob " + hex; return false; }
 	return true;
 }
 
@@ -263,8 +287,9 @@ int main(int argc, char** argv) {
 	std::string name;
 	if ( (bool)usage["name"] ) name = usage["name"].value;
 	else if ( df_mode ) {   // default to the build-context dir name (the base ref would be wrong)
-		char cbuf[4096];
-		std::string ctx_abs = realpath(df_ctx.c_str(), cbuf) ? std::string(cbuf) : df_ctx;
+		char* crp = realpath(df_ctx.c_str(), nullptr);   // PATH_MAX-safe (realpath allocates)
+		std::string ctx_abs = crp ? std::string(crp) : df_ctx;
+		free(crp);
 		std::string::size_type cs = ctx_abs.find_last_of('/');
 		name = ( cs == std::string::npos ) ? ctx_abs : ctx_abs.substr(cs + 1);
 		if ( name.empty()) name = "container";
@@ -347,8 +372,9 @@ int main(int argc, char** argv) {
 	copy_file(cfgblob, out + "/image-config.json");
 	write_file_str(out + "/manifest.json", img.manifest_json);
 
-	char abuf[4096];
-	std::string abs_out = realpath(out.c_str(), abuf) ? std::string(abuf) : out;
+	char* orp = realpath(out.c_str(), nullptr);   // PATH_MAX-safe (realpath allocates)
+	std::string abs_out = orp ? std::string(orp) : out;
+	free(orp);
 
 	// optional bundle-side emitters, then the always-written notes + bind warning
 	bool emit_net = bo.network_isolated || (bool)usage["emit-netconfig"];

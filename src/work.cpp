@@ -41,7 +41,9 @@ void Dir::cleanup() {
 	// unmount registered binds (reverse order, lazy) BEFORE removing the tree
 	for ( auto it = mounts_.rbegin(); it != mounts_.rend(); ++it )
 		umount2(it->c_str(), MNT_DETACH);
-	nftw(path_.c_str(), rm_entry, 16, FTW_DEPTH | FTW_PHYS);
+	// FTW_MOUNT: never cross a mount point - if any bind survived (e.g. a SIGKILL
+	// before the umount above), don't recurse into it (host /proc, /dev, /sys)
+	nftw(path_.c_str(), rm_entry, 16, FTW_DEPTH | FTW_PHYS | FTW_MOUNT);
 }
 
 }
