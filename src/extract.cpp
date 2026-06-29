@@ -71,6 +71,7 @@ static bool decomp_zstd(const std::string& in, const std::string& out, std::stri
 		}
 		if ( !ok ) break;
 	}
+	if ( ok && std::ferror(inf)) { err = "read error on " + in; ok = false; }   // fread()==0 can be error, not just EOF
 	ZSTD_freeDStream(ds); std::fclose(inf); std::fclose(of);
 	return ok;
 }
@@ -92,6 +93,7 @@ static bool decomp_xz(const std::string& in, const std::string& out, std::string
 		if ( strm.avail_in == 0 && !std::feof(inf)) {
 			strm.next_in = ibuf;
 			strm.avail_in = std::fread(ibuf, 1, sizeof ibuf, inf);
+			if ( std::ferror(inf)) { err = "read error on " + in; ok = false; break; }   // else a read error spins forever (avail_in stays 0, !feof)
 			if ( std::feof(inf)) action = LZMA_FINISH;
 		}
 		strm.next_out = obuf; strm.avail_out = sizeof obuf;
@@ -194,7 +196,7 @@ static std::string pax_get(const std::string& rec, const std::string& key) {
 		size_t sp = rec.find(' ', i);
 		if ( sp == std::string::npos ) break;
 		unsigned long len = std::strtoul(rec.c_str() + i, nullptr, 10);
-		if ( len == 0 || i + len > rec.size()) break;
+		if ( len == 0 || i + len > rec.size() || sp + 1 > i + len ) break;   // malformed: space past record end would underflow the substr length
 		std::string kv = rec.substr(sp + 1, ( i + len ) - (sp + 1));
 		if ( !kv.empty() && kv.back() == '\n' ) kv.pop_back();
 		size_t eq = kv.find('=');
