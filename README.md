@@ -1,5 +1,7 @@
 # docker2uxc
 
+[![CI build](https://img.shields.io/github/actions/workflow/status/oskarirauta/docker2uxc/build.yml?branch=docker2uxcd&style=plastic&label=build)](https://github.com/oskarirauta/docker2uxc/actions/workflows/build.yml)
+
 Turn a Docker/OCI **registry image** into an [OpenWrt **uxc**](https://openwrt.org/)
 (procd/ujail) OCI runtime bundle — no Docker, Podman, containerd or skopeo
 required on the host.
