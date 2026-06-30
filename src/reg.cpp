@@ -10,7 +10,7 @@ namespace reg {
 
 bool register_container(const std::string& uxc_dir, const std::string& name, const std::string& abs_out,
                         const std::string& image, const std::string& digest, const std::string& infra,
-                        bool autostart, std::string& err) {
+                        bool autostart, const JSON& web_ports, std::string& err) {
 	mkdir(uxc_dir.c_str(), 0755);
 	std::string path = uxc_dir + "/" + name + ".json";
 
@@ -29,6 +29,8 @@ bool register_container(const std::string& uxc_dir, const std::string& name, con
 	if ( !digest.empty()) merged["digest"] = digest;
 	if ( !infra.empty()) merged["infra"] = infra;       // only when given -> existing infra survives
 	if ( autostart ) merged["autostart"] = true;        // only when flagged -> existing survives
+	if ( web_ports.type() == JSON::TYPE::ARRAY && web_ports.begin() != web_ports.end() && !merged.contains("web_ports"))
+		merged["web_ports"] = web_ports;            // EXPOSE-derived prefill; only when the user has none
 
 	std::string tmp = path + ".tmp";
 	{

@@ -9,6 +9,7 @@
 #include <unistd.h>
 #include <sys/stat.h>
 #include <cstdlib>
+#include <set>
 
 namespace emit {
 namespace {
@@ -85,6 +86,44 @@ std::string object_keys_block(const JSON& parent, const char* key) {
 }
 
 } // anonymous namespace
+
+// Pre-fill web_ports from the image's EXPOSE list: read <out>/image-config.json,
+// take .config.ExposedPorts, keep only tcp ports that look like a web UI (a
+// curated allow-list - DB/cache/broker ports are deliberately excluded so we
+// don't offer a useless "open" link). 443/8443/9443 default to https. Returns a
+// JSON array [{ port, scheme? }] (empty if none / unreadable); the user labels
+// and trims them in the LuCI editor. register_container only applies this when
+// the entry has no web_ports yet, so re-pulls never clobber manual edits.
+JSON web_ports_from_image(const std::string& image_config_path) {
+	static const std::set<int> web_typical = {
+		80, 443, 3000, 3001, 4000, 5000, 7860, 8000, 8008,
+		8080, 8081, 8096, 8123, 8443, 8888, 9000, 9090, 9443
+	};
+	JSON out = JSON::Array();
+	bool ok;
+	std::string s = read_file(image_config_path, ok);
+	if ( !ok ) return out;
+	JSON blob; try { blob = JSON::parse(s); } catch ( ... ) { return out; }
+	if ( blob.type() != JSON::TYPE::OBJECT || !blob.contains("config")) return out;
+	JSON icfg = blob["config"];
+	if ( icfg.type() != JSON::TYPE::OBJECT || !icfg.contains("ExposedPorts") ||
+	     icfg["ExposedPorts"].type() != JSON::TYPE::OBJECT )
+		return out;
+	JSON ep = icfg["ExposedPorts"];
+	for ( auto it = ep.begin(); it != ep.end(); ++it ) {
+		std::string k = it.key();                        // "80/tcp"
+		std::string::size_type slash = k.find('/');
+		std::string proto = ( slash == std::string::npos ) ? "tcp" : k.substr(slash + 1);
+		if ( proto != "tcp" ) continue;                  // web UIs are tcp
+		int port = atoi(( slash == std::string::npos ? k : k.substr(0, slash)).c_str());
+		if ( port <= 0 || !web_typical.count(port)) continue;
+		JSON e = JSON::Object();
+		e["port"] = (long long)port;
+		if ( port == 443 || port == 8443 || port == 9443 ) e["scheme"] = "https";
+		out.append(e);
+	}
+	return out;
+}
 
 std::string profile_dir() {
 	const char* env = getenv("DOCKER2UXC_PROFILES");

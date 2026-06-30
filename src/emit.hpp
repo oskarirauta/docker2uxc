@@ -1,5 +1,6 @@
 #pragma once
 #include <string>
+#include "json.hpp"
 
 // Bundle-side output generators: profile overlay + the optional /etc/config
 // network snippet, the procd "keeper" service, the README.notes guide, and a
@@ -41,6 +42,12 @@ struct NotesInfo {
 };
 // Write <out>/README.notes - a human-readable install/network/ports/volumes guide.
 bool notes(const NotesInfo& ni, std::string& err);
+
+// Pre-fill web_ports from the image's EXPOSE list (image-config.json ->
+// .config.ExposedPorts), keeping only web-typical tcp ports. Returns a JSON
+// array [{ port, scheme? }] (empty if none). register_container applies it only
+// when the entry has no web_ports yet, so manual edits/re-pulls are preserved.
+JSON web_ports_from_image(const std::string& image_config_path);
 
 // Warn (to the log) about bind mount sources in config.json that don't exist on
 // the host yet - ujail fails the whole container if any bind source is missing.

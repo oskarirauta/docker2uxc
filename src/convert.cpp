@@ -284,8 +284,12 @@ bool convert(Options& o, std::string& err) {
 		// a Dockerfile FROM is the base image, not "the image" - no update provenance
 		std::string prov_image  = df_mode ? std::string() : ref_str;
 		std::string prov_digest = df_mode ? std::string() : img.provenance_digest;
-		if ( !reg::register_container(o.uxc_dir, name, abs_out, prov_image, prov_digest, o.infra, o.autostart, err)) { err = "register: " + err; return false; }
+		// EXPOSE -> web_ports prefill (pull only; a build's EXPOSE is the base image's)
+		JSON web_ports = df_mode ? JSON::Array() : emit::web_ports_from_image(out + "/image-config.json");
+		if ( !reg::register_container(o.uxc_dir, name, abs_out, prov_image, prov_digest, o.infra, o.autostart, web_ports, err)) { err = "register: " + err; return false; }
 		logger::info << "==> registered: " << o.uxc_dir << "/" << name << ".json" << std::endl;
+		if ( web_ports.begin() != web_ports.end())
+			logger::info << "    web UI port(s) detected from EXPOSE - review/label them in LuCI" << std::endl;
 	}
 
 	o.result_name = name;
