@@ -49,6 +49,10 @@ bool notes(const NotesInfo& ni, std::string& err);
 // when the entry has no web_ports yet, so manual edits/re-pulls are preserved.
 JSON web_ports_from_image(const std::string& image_config_path);
 
+// Pre-fill stop_signal from the image's STOPSIGNAL (.config.StopSignal); "" if none.
+// register_container applies it only when the entry has no stop_signal yet.
+std::string stop_signal_from_image(const std::string& image_config_path);
+
 // Warn (to the log) about bind mount sources in config.json that don't exist on
 // the host yet - ujail fails the whole container if any bind source is missing.
 void warn_missing_binds(const std::string& config_json_path);

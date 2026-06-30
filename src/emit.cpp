@@ -125,6 +125,19 @@ JSON web_ports_from_image(const std::string& image_config_path) {
 	return out;
 }
 
+// Pre-fill stop_signal from the image's STOPSIGNAL (.config.StopSignal). Postgres
+// ships SIGINT, nginx SIGQUIT - carry it so the daemon stops them cleanly.
+std::string stop_signal_from_image(const std::string& image_config_path) {
+	bool ok;
+	std::string s = read_file(image_config_path, ok);
+	if ( !ok ) return "";
+	JSON blob; try { blob = JSON::parse(s); } catch ( ... ) { return ""; }
+	if ( blob.type() != JSON::TYPE::OBJECT || !blob.contains("config")) return "";
+	JSON icfg = blob["config"];
+	if ( icfg.type() != JSON::TYPE::OBJECT || !icfg.contains("StopSignal")) return "";
+	return icfg["StopSignal"].to_string();
+}
+
 std::string profile_dir() {
 	const char* env = getenv("DOCKER2UXC_PROFILES");
 	if ( env && *env ) return env;
