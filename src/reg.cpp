@@ -4,6 +4,7 @@
 #include <fstream>
 #include <iterator>
 #include <cstdio>
+#include <ctime>
 #include <sys/stat.h>
 
 namespace reg {
@@ -26,6 +27,11 @@ bool register_container(const std::string& uxc_dir, const std::string& name, con
 	merged["name"] = name;
 	merged["path"] = abs_out;
 	if ( !image.empty()) merged["image"] = image;
+	// created: first registration only; upgraded: the digest changed (a re-pull to a
+	// NEW image). A same-digest re-pull is not an upgrade, so compare before overwriting.
+	if ( !merged.contains("created")) merged["created"] = (long long)time(nullptr);
+	if ( !digest.empty() && merged.contains("digest") && merged["digest"].to_string() != digest )
+		merged["upgraded"] = (long long)time(nullptr);
 	if ( !digest.empty()) merged["digest"] = digest;
 	if ( !infra.empty()) merged["infra"] = infra;       // only when given -> existing infra survives
 	if ( autostart ) merged["autostart"] = true;        // only when flagged -> existing survives
