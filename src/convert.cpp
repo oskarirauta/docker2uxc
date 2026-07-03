@@ -208,13 +208,18 @@ bool convert(Options& o, std::string& err) {
 	std::string name = o.name;
 
 	if ( df_mode ) {
+		struct stat dst;
+		if ( stat(o.dockerfile.c_str(), &dst) != 0 ) { err = "dockerfile not found: " + o.dockerfile; return false; }
+		if ( S_ISDIR(dst.st_mode)) {              // a directory: build <dir>/Dockerfile
+			if ( o.context.empty()) o.context = o.dockerfile;
+			o.dockerfile += "/Dockerfile";
+			if ( stat(o.dockerfile.c_str(), &dst) != 0 ) { err = "no Dockerfile in directory " + o.context; return false; }
+		}
 		df_ctx = o.context;
 		if ( df_ctx.empty()) {
 			std::string::size_type sl = o.dockerfile.find_last_of('/');
 			df_ctx = ( sl == std::string::npos ) ? std::string(".") : ( sl == 0 ? std::string("/") : o.dockerfile.substr(0, sl));
 		}
-		struct stat dst;
-		if ( stat(o.dockerfile.c_str(), &dst) != 0 ) { err = "dockerfile not found: " + o.dockerfile; return false; }
 		if ( !dockerfile::parse_stages(o.dockerfile, stages, err)) return false;
 		logger::info << "dockerfile: " << o.dockerfile << "  (context: " << df_ctx << ", "
 		             << stages.size() << ( stages.size() == 1 ? " stage)" : " stages)" ) << std::endl;

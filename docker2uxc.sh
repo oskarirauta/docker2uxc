@@ -179,6 +179,10 @@ fi
 
 # In Dockerfile mode the base image(s) come from FROM, not a positional argument.
 if [ -n "$DOCKERFILE" ]; then
+	if [ -d "$DOCKERFILE" ]; then            # a directory: build <dir>/Dockerfile
+		[ -n "$CONTEXT" ] || CONTEXT=$DOCKERFILE
+		DOCKERFILE="$DOCKERFILE/Dockerfile"
+	fi
 	[ -f "$DOCKERFILE" ] || die "dockerfile not found: $DOCKERFILE"
 	[ -n "$CONTEXT" ] || CONTEXT=$(dirname -- "$DOCKERFILE")
 else
