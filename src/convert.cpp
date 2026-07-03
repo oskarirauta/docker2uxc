@@ -20,8 +20,10 @@
 #include <dirent.h>
 #include <sys/utsname.h>
 #include <sys/stat.h>
+#include <sys/wait.h>
 #include <unistd.h>
 #include <ftw.h>
+#include <cerrno>
 #include <cstdio>
 #include <cstdlib>
 
@@ -46,6 +48,23 @@ bool write_file_str(const std::string& path, const std::string& data) {
 	if ( !o ) return false;
 	o << data;
 	return (bool)o;
+}
+
+// cp -a <src>/. <dst>/ : clone a whole rootfs tree (used for FROM <earlier-stage>).
+// FTW_MOUNT in rm_rf protects removal; here the source stage's binds are already
+// torn down (its apply_stage returned), so we only ever copy plain files.
+bool copy_tree(const std::string& src, const std::string& dst, std::string& err) {
+	pid_t pid = fork();
+	if ( pid < 0 ) { err = "fork failed"; return false; }
+	if ( pid == 0 ) {
+		execlp("cp", "cp", "-a", ( src + "/." ).c_str(), ( dst + "/" ).c_str(), (char*)nullptr);
+		_exit(127);
+	}
+	int st = 0;
+	while ( waitpid(pid, &st, 0) < 0 && errno == EINTR ) {}
+	if ( WIFEXITED(st) && WEXITSTATUS(st) == 0 ) return true;
+	err = "cannot clone base stage rootfs (cp -a failed)";
+	return false;
 }
 
 std::string host_arch() {
@@ -104,6 +123,27 @@ bool fetch_blob_cached(const ImageRef& ref, const std::string& digest, const std
 	return true;
 }
 
+// Resolve a manifest, fetch its config blob into cfg_path, and extract every layer
+// into rootfs_dir. Shared by a plain pull and each image-based Dockerfile stage.
+bool pull_into(const ImageRef& ref, const std::string& arch_base, const std::string& arch_var,
+               const std::string& rootfs_dir, const std::string& cfg_path,
+               work::Dir& wd, const Options& o, manifest::Image& img, std::string& err) {
+	if ( !manifest::resolve(ref, arch_base, arch_var, o.auth_file, img, err)) return false;
+	logger::verbose << "  " << img.layers.size() << " layer(s), config " << img.config_digest << std::endl;
+	if ( !fetch_blob_cached(ref, img.config_digest, o.auth_file, cfg_path, o.verify, o.cache_dir, err)) { err = "config: " + err; return false; }
+	int li = 0;
+	for ( const auto& L : img.layers ) {
+		++li;
+		if ( work::cancelled ) { err = "cancelled"; return false; }
+		std::string lf = wd.path() + "/layer" + std::to_string(li);
+		logger::verbose << "  layer " << li << "/" << img.layers.size() << std::endl;
+		if ( !fetch_blob_cached(ref, L.digest, o.auth_file, lf, o.verify, o.cache_dir, err)) { err = "layer " + std::to_string(li) + ": " + err; return false; }
+		if ( !extract::layer(lf, rootfs_dir, wd.path() + "/layer.tar", err)) { err = "extract layer " + std::to_string(li) + ": " + err; return false; }
+		unlink(lf.c_str());
+	}
+	return true;
+}
+
 } // anonymous namespace
 
 std::string resolve_digest(const std::string& image, const std::string& auth_file, std::string& err) {
@@ -151,7 +191,21 @@ bool check_updates(const std::string& uxc_dir, const std::string& auth_file, std
 
 bool convert(Options& o, std::string& err) {
 	bool df_mode = !o.dockerfile.empty();
-	std::string ref_str, df_ctx;
+
+	// target arch (host default), split into base + variant once for all pulls
+	std::string arch = o.arch.empty() ? host_arch() : o.arch;
+	std::string arch_base = arch, arch_var;
+	{
+		std::string::size_type s = arch.find('/');
+		if ( s != std::string::npos ) { arch_base = arch.substr(0, s); arch_var = arch.substr(s + 1); }
+	}
+	logger::info << "arch:    linux/" << arch << std::endl;
+
+	// resolve what we're building (stages or a single ref) and its output name
+	std::vector<dockerfile::Stage> stages;
+	std::string df_ctx;
+	ImageRef    pull_ref;                 // pull mode only
+	std::string name = o.name;
 
 	if ( df_mode ) {
 		df_ctx = o.context;
@@ -161,46 +215,29 @@ bool convert(Options& o, std::string& err) {
 		}
 		struct stat dst;
 		if ( stat(o.dockerfile.c_str(), &dst) != 0 ) { err = "dockerfile not found: " + o.dockerfile; return false; }
-		ref_str = dockerfile::parse_from(o.dockerfile, err);
-		if ( ref_str.empty()) return false;   // err set by parse_from
-		logger::info << "dockerfile: " << o.dockerfile << "  (context: " << df_ctx << ")" << std::endl;
-	} else {
-		if ( o.image.empty()) { err = "missing image ref"; return false; }
-		ref_str = o.image;
-	}
-
-	ImageRef ref = parse_ref(ref_str);
-	logger::info << "image:   " << ref.reg << "/" << ref.repo
-	             << ( ref.digest.empty() ? ( ":" + ref.tag ) : ( "@" + ref.digest )) << std::endl;
-	logger::verbose << "apihost: " << ref.apihost << "  refdesc: " << ref.refdesc() << std::endl;
-
-	std::string arch = o.arch.empty() ? host_arch() : o.arch;
-	std::string arch_base = arch, arch_var;
-	std::string::size_type s = arch.find('/');
-	if ( s != std::string::npos ) { arch_base = arch.substr(0, s); arch_var = arch.substr(s + 1); }
-
-	manifest::Image img;
-	if ( !manifest::resolve(ref, arch_base, arch_var, o.auth_file, img, err)) return false;
-	logger::info << "arch:    linux/" << arch << std::endl;
-	logger::info << "config:  " << img.config_digest << std::endl;
-	logger::info << "layers:  " << img.layers.size() << std::endl;
-
-	std::string name = o.name;
-	if ( name.empty()) {
-		if ( df_mode ) {
+		if ( !dockerfile::parse_stages(o.dockerfile, stages, err)) return false;
+		logger::info << "dockerfile: " << o.dockerfile << "  (context: " << df_ctx << ", "
+		             << stages.size() << ( stages.size() == 1 ? " stage)" : " stages)" ) << std::endl;
+		if ( name.empty()) {
 			char* crp = realpath(df_ctx.c_str(), nullptr);   // PATH_MAX-safe
 			std::string ctx_abs = crp ? std::string(crp) : df_ctx;
 			free(crp);
 			std::string::size_type cs = ctx_abs.find_last_of('/');
 			name = ( cs == std::string::npos ) ? ctx_abs : ctx_abs.substr(cs + 1);
 			if ( name.empty()) name = "container";
-		} else {
-			std::string::size_type bs = ref.repo.find_last_of('/');
-			name = ref.repo.substr(bs == std::string::npos ? 0 : bs + 1);
+		}
+	} else {
+		if ( o.image.empty()) { err = "missing image ref"; return false; }
+		pull_ref = parse_ref(o.image);
+		logger::info << "image:   " << pull_ref.reg << "/" << pull_ref.repo
+		             << ( pull_ref.digest.empty() ? ( ":" + pull_ref.tag ) : ( "@" + pull_ref.digest )) << std::endl;
+		if ( name.empty()) {
+			std::string::size_type bs = pull_ref.repo.find_last_of('/');
+			name = pull_ref.repo.substr(bs == std::string::npos ? 0 : bs + 1);
 		}
 	}
-	std::string out = o.out.empty() ? ( "./" + name ) : o.out;
 
+	std::string out = o.out.empty() ? ( "./" + name ) : o.out;
 	struct stat ost;
 	bool exists = ( stat(out.c_str(), &ost) == 0 );
 	if ( exists && !o.force ) { err = "output exists: " + out + " (use force)"; return false; }
@@ -208,31 +245,80 @@ bool convert(Options& o, std::string& err) {
 
 	work::Dir wd;
 	if ( !wd.ok()) { err = "cannot create work directory"; return false; }
-	std::string rootfs = out + "/rootfs";
 	mkdir(out.c_str(), 0755);
-	mkdir(rootfs.c_str(), 0755);
+	std::string rootfs = out + "/rootfs";
 
-	logger::info << "==> " << out << "  (config + " << img.layers.size() << " layers)" << std::endl;
-	std::string cfgblob = wd.path() + "/config";
-	if ( !fetch_blob_cached(ref, img.config_digest, o.auth_file, cfgblob, o.verify, o.cache_dir, err)) { err = "config: " + err; return false; }
-
-	int li = 0;
-	for ( const auto& L : img.layers ) {
-		++li;
-		if ( work::cancelled ) { err = "cancelled"; return false; }
-		std::string lf = wd.path() + "/layer" + std::to_string(li);
-		logger::verbose << "  layer " << li << "/" << img.layers.size() << "  download" << std::endl;
-		if ( !fetch_blob_cached(ref, L.digest, o.auth_file, lf, o.verify, o.cache_dir, err)) { err = "layer " + std::to_string(li) + ": " + err; return false; }
-		logger::verbose << "  layer " << li << "/" << img.layers.size() << "  extract" << std::endl;
-		if ( !extract::layer(lf, rootfs, wd.path() + "/layer.tar", err)) { err = "extract layer " + std::to_string(li) + ": " + err; return false; }
-		unlink(lf.c_str());
-	}
-	logger::info << "==> rootfs extracted (" << img.layers.size() << " layers)" << std::endl;
+	// effective base image of the final rootfs (for manifest.json / notes / provenance)
+	ImageRef    eff_ref;
+	std::string eff_manifest, eff_cfgdigest, eff_prov;
+	std::string cfgblob;                  // path to the final image-config blob
 
 	if ( df_mode ) {
-		logger::info << "==> dockerfile build" << std::endl;
-		if ( !dockerfile::apply(o.dockerfile, df_ctx, rootfs, cfgblob, err)) { err = "dockerfile: " + err; return false; }
-		logger::info << "==> dockerfile build complete" << std::endl;
+		std::vector<std::string> st_rootfs(stages.size()), st_cfg(stages.size());
+		std::vector<ImageRef>    st_ref(stages.size());
+		std::vector<std::string> st_manifest(stages.size()), st_cfgdigest(stages.size()), st_prov(stages.size());
+		std::vector<char>        freed(stages.size(), 0);
+		std::vector<int>         last_use = dockerfile::stage_last_use(stages);
+		std::vector<dockerfile::BuiltStage> built;
+
+		for ( std::vector<dockerfile::Stage>::size_type i = 0; i < stages.size(); ++i ) {
+			if ( work::cancelled ) { err = "cancelled"; return false; }
+			bool is_final = ( i + 1 == stages.size());
+			std::string sdir = wd.path() + "/stage" + std::to_string(i);
+			mkdir(sdir.c_str(), 0755);
+			std::string cfg = sdir + "/config";
+			std::string rfs = is_final ? rootfs : ( sdir + "/rootfs" );
+			mkdir(rfs.c_str(), 0755);
+
+			logger::info << "==> stage " << ( i + 1 ) << "/" << stages.size()
+			             << ( stages[i].name.empty() ? std::string() : ( " (" + stages[i].name + ")" ))
+			             << ": FROM " << stages[i].base_ref << std::endl;
+
+			if ( stages[i].base_stage >= 0 ) {
+				int b = stages[i].base_stage;
+				if ( freed[b] ) { err = "stage " + std::to_string(i + 1) + ": base stage rootfs already freed (internal)"; return false; }
+				std::string cerr;
+				if ( !copy_tree(st_rootfs[b], rfs, cerr)) { err = "stage " + std::to_string(i + 1) + ": " + cerr; return false; }
+				if ( !copy_file(st_cfg[b], cfg)) { err = "stage " + std::to_string(i + 1) + ": cannot inherit base config"; return false; }
+				st_ref[i] = st_ref[b]; st_manifest[i] = st_manifest[b];
+				st_cfgdigest[i] = st_cfgdigest[b]; st_prov[i] = st_prov[b];
+			} else {
+				ImageRef ref = parse_ref(stages[i].base_ref);
+				manifest::Image img;
+				if ( !pull_into(ref, arch_base, arch_var, rfs, cfg, wd, o, img, err)) return false;
+				st_ref[i] = ref; st_manifest[i] = img.manifest_json;
+				st_cfgdigest[i] = img.config_digest; st_prov[i] = img.provenance_digest;
+			}
+
+			if ( !dockerfile::apply_stage(stages[i], df_ctx, rfs, cfg, built, err)) {
+				err = "stage " + std::to_string(i + 1) + ": " + err; return false;
+			}
+
+			st_rootfs[i] = rfs; st_cfg[i] = cfg;
+			built.push_back({ stages[i].name, (int)i, rfs });
+
+			// free earlier intermediate stages whose last consumer was this stage
+			for ( std::vector<dockerfile::Stage>::size_type j = 0; j < i; ++j ) {
+				if ( freed[j] || ( j + 1 == stages.size())) continue;
+				if ( last_use[j] <= (int)i ) { rm_rf(st_rootfs[j]); freed[j] = 1; }
+			}
+		}
+
+		cfgblob       = st_cfg.back();
+		eff_ref       = st_ref.back();
+		eff_manifest  = st_manifest.back();
+		eff_cfgdigest = st_cfgdigest.back();
+		eff_prov      = st_prov.back();
+		logger::info << "==> build complete (" << stages.size()
+		             << ( stages.size() == 1 ? " stage)" : " stages)" ) << std::endl;
+	} else {
+		mkdir(rootfs.c_str(), 0755);
+		cfgblob = wd.path() + "/config";
+		manifest::Image img;
+		if ( !pull_into(pull_ref, arch_base, arch_var, rootfs, cfgblob, wd, o, img, err)) return false;
+		eff_ref = pull_ref; eff_manifest = img.manifest_json;
+		eff_cfgdigest = img.config_digest; eff_prov = img.provenance_digest;
+		logger::info << "==> rootfs extracted (" << img.layers.size() << " layers)" << std::endl;
 	}
 
 	bundle::Opts bo;
@@ -251,7 +337,7 @@ bool convert(Options& o, std::string& err) {
 	}
 
 	copy_file(cfgblob, out + "/image-config.json");
-	write_file_str(out + "/manifest.json", img.manifest_json);
+	write_file_str(out + "/manifest.json", eff_manifest);
 
 	char* orp = realpath(out.c_str(), nullptr);   // PATH_MAX-safe
 	std::string abs_out = orp ? std::string(orp) : out;
@@ -265,9 +351,9 @@ bool convert(Options& o, std::string& err) {
 		ni.out               = out;
 		ni.name              = name;
 		ni.version           = VERSION;
-		ni.source            = ref.reg + "/" + ref.repo + ":" + ref.tag;
+		ni.source            = eff_ref.reg + "/" + eff_ref.repo + ":" + eff_ref.tag;
 		ni.arch              = arch;
-		ni.config_digest     = img.config_digest;
+		ni.config_digest     = eff_cfgdigest;
 		ni.image_config_path = out + "/image-config.json";
 		ni.config_json_path  = out + "/config.json";
 		ni.abs_out           = abs_out;
@@ -282,8 +368,8 @@ bool convert(Options& o, std::string& err) {
 
 	if ( o.do_register ) {
 		// a Dockerfile FROM is the base image, not "the image" - no update provenance
-		std::string prov_image  = df_mode ? std::string() : ref_str;
-		std::string prov_digest = df_mode ? std::string() : img.provenance_digest;
+		std::string prov_image  = df_mode ? std::string() : o.image;
+		std::string prov_digest = df_mode ? std::string() : eff_prov;
 		// EXPOSE -> web_ports prefill (pull only; a build's EXPOSE is the base image's)
 		JSON web_ports = df_mode ? JSON::Array() : emit::web_ports_from_image(out + "/image-config.json");
 		std::string stop_sig = df_mode ? std::string() : emit::stop_signal_from_image(out + "/image-config.json");

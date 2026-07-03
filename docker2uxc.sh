@@ -102,8 +102,8 @@ Options:
       --check-updates  report which registered containers have a newer image
                        (one line per container: name<TAB>state<TAB>digest)
       --dockerfile F   build from a Dockerfile instead of pulling a ready image
-                       (FROM gives the base; RUN/COPY/ADD/ENV/WORKDIR/USER/CMD/
-                       ENTRYPOINT supported; single-stage, host architecture)
+                       (multi-stage FROM..AS + COPY --from=<name|index> supported;
+                       RUN/COPY/ADD/ENV/WORKDIR/USER/CMD/ENTRYPOINT; host arch)
       --context DIR    build context for COPY/ADD (default: the Dockerfile's dir)
       --cache DIR      blob cache directory (default: $CACHE)
       --no-verify      skip sha256 digest verification of blobs
@@ -177,13 +177,10 @@ if [ "$CHECK_UPDATES" -eq 1 ]; then
 	exit 0
 fi
 
-# In Dockerfile mode the base image comes from FROM, not a positional argument.
+# In Dockerfile mode the base image(s) come from FROM, not a positional argument.
 if [ -n "$DOCKERFILE" ]; then
 	[ -f "$DOCKERFILE" ] || die "dockerfile not found: $DOCKERFILE"
 	[ -n "$CONTEXT" ] || CONTEXT=$(dirname -- "$DOCKERFILE")
-	REF=$(awk 'toupper($1)=="FROM"{for(i=2;i<=NF;i++) if($i !~ /^--/){print $i; exit}}' "$DOCKERFILE")
-	[ -n "$REF" ] || die "no FROM instruction in $DOCKERFILE"
-	case $REF in *" AS "*|*" as "*) die "multi-stage builds are not supported (single FROM only)" ;; esac
 else
 	[ $# -ge 1 ] || { usage >&2; exit 2; }
 	REF=$1
@@ -212,55 +209,52 @@ ARCH_BASE=${ARCH%%/*}
 ARCH_VAR=""
 [ "$ARCH" != "$ARCH_BASE" ] && ARCH_VAR=${ARCH#*/}
 
+# ===========================================================================
+#  functions (definitions only; the build below drives them)
+# ===========================================================================
+
 # ----------------------------------------------------------- reference parse --
-# Split [registry/]repo[:tag|@digest]
-REG="" REPO="" TAG="" DIGEST=""
-rest=$REF
-# digest?
-case $rest in *@*) DIGEST=${rest#*@}; rest=${rest%@*} ;; esac
-# registry = first path component, but only if there's a '/' AND it looks like a
-# host (contains '.' or ':' port, or is localhost). Otherwise it's docker.io.
-case $rest in
-	*/*)
-		first=${rest%%/*}
-		case $first in
-			*.*|*:*|localhost) REG=$first; rest=${rest#*/} ;;
-			*)                 REG=docker.io ;;
-		esac ;;
-	*) REG=docker.io ;;
-esac
-# tag = colon in the last path component (never a registry port, which we removed)
-last=${rest##*/}
-case $last in
-	*:*)
-		TAG=${last##*:}
-		newlast=${last%:*}
-		case $rest in
-			*/*) rest="${rest%/*}/$newlast" ;;
-			*)   rest=$newlast ;;
-		esac ;;
-esac
-REPO=$rest
-[ -n "$TAG" ] || TAG=latest
-# docker.io: official images live under library/
-if [ "$REG" = "docker.io" ]; then
-	case $REPO in */*) ;; *) REPO="library/$REPO" ;; esac
-	APIHOST=registry-1.docker.io
-else
-	APIHOST=$REG
-fi
-
-# default name: the build-context dir in Dockerfile mode (the base image name
-# would be wrong), else the image repo basename.
-if [ -z "$NAME" ]; then
-	if [ -n "$DOCKERFILE" ]; then NAME=$(basename -- "$(cd "$CONTEXT" && pwd)"); else NAME=${REPO##*/}; fi
-fi
-[ -n "$OUT" ]  || OUT="./$NAME"
-
-REFDESC=${DIGEST:-$TAG}
-log "==> image:    $REG/$REPO ${DIGEST:+@$DIGEST}${DIGEST:+ }${DIGEST:-:$TAG}"
-log "==> arch:     $ARCH"
-log "==> bundle:   $OUT  (name: $NAME)"
+# Split [registry/]repo[:tag|@digest] from $1 into REG/REPO/TAG/DIGEST/APIHOST
+# + REFDESC. Called once per pull (a plain pull, or each image-based stage).
+parse_ref() {
+	_ref=$1
+	REG="" ; REPO="" ; TAG="" ; DIGEST=""
+	rest=$_ref
+	# digest?
+	case $rest in *@*) DIGEST=${rest#*@}; rest=${rest%@*} ;; esac
+	# registry = first path component, but only if there's a '/' AND it looks like a
+	# host (contains '.' or ':' port, or is localhost). Otherwise it's docker.io.
+	case $rest in
+		*/*)
+			first=${rest%%/*}
+			case $first in
+				*.*|*:*|localhost) REG=$first; rest=${rest#*/} ;;
+				*)                 REG=docker.io ;;
+			esac ;;
+		*) REG=docker.io ;;
+	esac
+	# tag = colon in the last path component (never a registry port, which we removed)
+	last=${rest##*/}
+	case $last in
+		*:*)
+			TAG=${last##*:}
+			newlast=${last%:*}
+			case $rest in
+				*/*) rest="${rest%/*}/$newlast" ;;
+				*)   rest=$newlast ;;
+			esac ;;
+	esac
+	REPO=$rest
+	[ -n "$TAG" ] || TAG=latest
+	# docker.io: official images live under library/
+	if [ "$REG" = "docker.io" ]; then
+		case $REPO in */*) ;; *) REPO="library/$REPO" ;; esac
+		APIHOST=registry-1.docker.io
+	else
+		APIHOST=$REG
+	fi
+	REFDESC=${DIGEST:-$TAG}
+}
 
 # ---------------------------------------------------------------- http layer --
 # wget wrapper: $1=url $2=outfile, remaining args are extra --header values.
@@ -326,69 +320,7 @@ get_token() {
 	[ -n "$TOKEN" ] && vlog "got token (${#TOKEN} chars)" || vlog "no token (anonymous or Basic registry)"
 }
 
-# -------------------------------------------------------------- manifest fetch
-WORK=$(mktemp -d)
-# Unmount any Dockerfile-build binds BEFORE removing $WORK - otherwise rm -rf
-# would recurse into bind-mounted /proc, /dev, /sys (i.e. the host's!).
-cleanup() {
-	for _m in proc dev sys; do umount "$WORK/rootfs/$_m" 2>/dev/null || true; done
-	rm -rf "$WORK"
-}
-trap cleanup EXIT INT TERM
-
-get_token
-
-log "==> resolving manifest"
-http_get "https://$APIHOST/v2/$REPO/manifests/$REFDESC" "$WORK/idx.json" \
-	--header="Accept: $ACCEPT_MANIFEST" \
-	|| die "failed to fetch manifest (private image, or wrong ref?)"
-
-# provenance: the digest this ref resolved to (sha256 of the index/manifest the
-# tag points to) lets uxcd later re-resolve the same ref and detect an update.
-# Only for direct pulls - a Dockerfile FROM is the base image, not "the image".
-if [ -z "$DOCKERFILE" ]; then
-	PROV_IMAGE=$REF
-	PROV_DIGEST="sha256:$(sha256sum "$WORK/idx.json" | awk '{print $1}')"
-fi
-
-# --resolve-digest: print the digest the ref resolves to (manifest-only, no
-# blobs) and stop. Used by uxcd's update check; logs go to stderr so stdout is
-# just the digest.
-[ "$RESOLVE_ONLY" -eq 1 ] && { printf 'sha256:%s\n' "$(sha256sum "$WORK/idx.json" | awk '{print $1}')"; exit 0; }
-
-MTYPE=$(jq -r '.mediaType // ""' "$WORK/idx.json")
-case $MTYPE in
-	*image.index*|*manifest.list*)
-		vlog "multi-arch index; selecting linux/$ARCH"
-		SEL=$(jq -r --arg a "$ARCH_BASE" --arg v "$ARCH_VAR" '
-			.manifests[]
-			| select(.platform.os=="linux"
-			         and .platform.architecture==$a
-			         and ((.platform.variant // "")==$v))
-			| .digest' "$WORK/idx.json" | head -n1)
-		[ -n "$SEL" ] || {
-			log "available platforms:"
-			jq -r '.manifests[] | "    \(.platform.os)/\(.platform.architecture)\(.platform.variant // "")"' "$WORK/idx.json" >&2
-			die "no manifest for linux/$ARCH"
-		}
-		vlog "selected $SEL"
-		http_get "https://$APIHOST/v2/$REPO/manifests/$SEL" "$WORK/manifest.json" \
-			--header="Accept: $ACCEPT_MANIFEST" \
-			|| die "failed to fetch per-arch manifest"
-		;;
-	*)
-		cp "$WORK/idx.json" "$WORK/manifest.json"
-		;;
-esac
-
-CONFIG_DIGEST=$(jq -r '.config.digest' "$WORK/manifest.json")
-[ "$CONFIG_DIGEST" != null ] || die "manifest has no config (unexpected media type: $MTYPE)"
-NLAYERS=$(jq -r '.layers | length' "$WORK/manifest.json")
-log "==> $NLAYERS layer(s), config $CONFIG_DIGEST"
-
 # ------------------------------------------------------------------ blob pull --
-mkdir -p "$CACHE"
-
 blob_path() { echo "$CACHE/${1#sha256:}"; }
 
 fetch_blob() {
@@ -417,27 +349,7 @@ fetch_blob() {
 	echo "$_p"
 }
 
-log "==> downloading config"
-CONFIG_BLOB=$(fetch_blob "$CONFIG_DIGEST")
-
-log "==> downloading $NLAYERS layer(s)"
-i=0
-LAYERS=""
-while [ "$i" -lt "$NLAYERS" ]; do
-	d=$(jq -r ".layers[$i].digest" "$WORK/manifest.json")
-	mt=$(jq -r ".layers[$i].mediaType" "$WORK/manifest.json")
-	sz=$(jq -r ".layers[$i].size" "$WORK/manifest.json")
-	log "    [$((i+1))/$NLAYERS] ${d#sha256:}  ($((sz/1024/1024)) MB, ${mt##*.})"
-	bp=$(fetch_blob "$d")
-	LAYERS="$LAYERS$bp	$mt
-"
-	i=$((i+1))
-done
-
 # ------------------------------------------------------------------- flatten ---
-ROOTFS="$WORK/rootfs"
-mkdir -p "$ROOTFS"
-
 decompress_to() {
 	# $1 = blob path, $2 = mediaType ; emits a tar stream on stdout
 	case $2 in
@@ -474,61 +386,130 @@ apply_whiteouts() {
 	done
 }
 
-log "==> flattening into rootfs"
-printf '%s' "$LAYERS" | while IFS='	' read -r bp mt; do
-	[ -n "$bp" ] || continue
-	if decompress_to "$bp" "$mt" | tar -t 2>/dev/null | grep -q '\(^\|/\)\.wh\.'; then
-		# safe path: extract to temp, apply whiteouts, merge
-		ldir="$WORK/layer.$$"
-		rm -rf "$ldir"; mkdir -p "$ldir"
-		decompress_to "$bp" "$mt" | tar -x -p -C "$ldir" 2>/dev/null || true
-		apply_whiteouts "$ldir" "$ROOTFS"
-		cp -a "$ldir/." "$ROOTFS/" 2>/dev/null || true
-		rm -rf "$ldir"
-	else
-		# fast path: no whiteouts, extract straight in
-		decompress_to "$bp" "$mt" | tar -x -p -C "$ROOTFS" 2>/dev/null || true
-	fi
-done
+# Pull an image ref ($1) and flatten every layer into a rootfs dir ($2). Sets
+# CONFIG_BLOB (path to the base image config), CONFIG_DIGEST, INDEX_SHA (sha256
+# of the manifest the ref resolved to, for provenance) and writes the per-arch
+# manifest to $WORK/manifest.json. Shared by a plain pull and each image stage.
+pull_base() {
+	_pref=$1; _prootfs=$2
+	TOKEN=""; BASIC=""                     # fresh auth per registry
+	parse_ref "$_pref"
+	get_token
+	http_get "https://$APIHOST/v2/$REPO/manifests/$REFDESC" "$WORK/idx.json" \
+		--header="Accept: $ACCEPT_MANIFEST" \
+		|| die "failed to fetch manifest for $_pref (private image, or wrong ref?)"
+	INDEX_SHA=$(sha256sum "$WORK/idx.json" | awk '{print $1}')
+
+	_mtype=$(jq -r '.mediaType // ""' "$WORK/idx.json")
+	case $_mtype in
+		*image.index*|*manifest.list*)
+			vlog "multi-arch index; selecting linux/$ARCH"
+			_sel=$(jq -r --arg a "$ARCH_BASE" --arg v "$ARCH_VAR" '
+				.manifests[]
+				| select(.platform.os=="linux"
+				         and .platform.architecture==$a
+				         and ((.platform.variant // "")==$v))
+				| .digest' "$WORK/idx.json" | head -n1)
+			[ -n "$_sel" ] || {
+				log "available platforms:"
+				jq -r '.manifests[] | "    \(.platform.os)/\(.platform.architecture)\(.platform.variant // "")"' "$WORK/idx.json" >&2
+				die "no manifest for linux/$ARCH in $_pref"
+			}
+			http_get "https://$APIHOST/v2/$REPO/manifests/$_sel" "$WORK/manifest.json" \
+				--header="Accept: $ACCEPT_MANIFEST" \
+				|| die "failed to fetch per-arch manifest for $_pref"
+			;;
+		*)
+			cp "$WORK/idx.json" "$WORK/manifest.json"
+			;;
+	esac
+
+	CONFIG_DIGEST=$(jq -r '.config.digest' "$WORK/manifest.json")
+	[ "$CONFIG_DIGEST" != null ] || die "manifest has no config (unexpected media type: $_mtype)"
+	_nlayers=$(jq -r '.layers | length' "$WORK/manifest.json")
+	vlog "$_nlayers layer(s), config $CONFIG_DIGEST"
+
+	mkdir -p "$CACHE" "$_prootfs"
+	CONFIG_BLOB=$(fetch_blob "$CONFIG_DIGEST")
+
+	# download + flatten each layer straight into $_prootfs
+	_i=0
+	while [ "$_i" -lt "$_nlayers" ]; do
+		_d=$(jq -r ".layers[$_i].digest" "$WORK/manifest.json")
+		_mt=$(jq -r ".layers[$_i].mediaType" "$WORK/manifest.json")
+		_sz=$(jq -r ".layers[$_i].size" "$WORK/manifest.json")
+		vlog "layer $((_i+1))/$_nlayers ${_d#sha256:} ($((_sz/1024/1024)) MB)"
+		_bp=$(fetch_blob "$_d")
+		if decompress_to "$_bp" "$_mt" | tar -t 2>/dev/null | grep -q '\(^\|/\)\.wh\.'; then
+			# safe path: extract to temp, apply whiteouts, merge
+			_ldir="$WORK/layer.$$.$_i"
+			rm -rf "$_ldir"; mkdir -p "$_ldir"
+			decompress_to "$_bp" "$_mt" | tar -x -p -C "$_ldir" 2>/dev/null || true
+			apply_whiteouts "$_ldir" "$_prootfs"
+			cp -a "$_ldir/." "$_prootfs/" 2>/dev/null || true
+			rm -rf "$_ldir"
+		else
+			# fast path: no whiteouts, extract straight in
+			decompress_to "$_bp" "$_mt" | tar -x -p -C "$_prootfs" 2>/dev/null || true
+		fi
+		_i=$((_i+1))
+	done
+}
 
 # ------------------------------------------------------- dockerfile build ----
-# Apply the Dockerfile on top of the FROM rootfs: RUN runs inside the rootfs
-# (chroot, with /proc /dev /sys bound and the host resolver for network), COPY/ADD
-# pull files from the build context, and ENV/WORKDIR/USER/CMD/ENTRYPOINT update
-# the image config (read by the config.json step below). Single-stage, host arch.
-if [ -n "$DOCKERFILE" ]; then
+# RUN runs inside a stage's rootfs (chroot, with /proc /dev /sys bound and the
+# host resolver for network); COPY/ADD pull files from the build context or, with
+# --from=<name|index>, from an earlier stage's rootfs; ENV/WORKDIR/USER/CMD/
+# ENTRYPOINT update that stage's image config (read by the config.json step).
+mnt_up() {
+	mkdir -p "$ROOTFS/proc" "$ROOTFS/dev" "$ROOTFS/sys" "$ROOTFS/etc"
+	# clear any stale binds left by a previously crashed build (defensive)
+	umount "$ROOTFS/proc" 2>/dev/null || true
+	umount "$ROOTFS/dev"  2>/dev/null || true
+	umount "$ROOTFS/sys"  2>/dev/null || true
+	mount -o bind /proc "$ROOTFS/proc" 2>/dev/null || die "cannot bind /proc into rootfs (need root)"
+	mount -o bind /dev  "$ROOTFS/dev"  2>/dev/null || true
+	mount -o bind /sys  "$ROOTFS/sys"  2>/dev/null || true
+	[ -f /etc/resolv.conf ] && cp -L /etc/resolv.conf "$ROOTFS/etc/resolv.conf" 2>/dev/null || true
+}
+mnt_down() { for _m in proc dev sys; do umount "$ROOTFS/$_m" 2>/dev/null || true; done; }
+
+cfg_jq() { jq "$@" "$CONFIG_BLOB" > "$WORK/.cfg" && mv "$WORK/.cfg" "$CONFIG_BLOB"; }
+
+# Resolve a COPY --from=<name|index> token ($1) to a built stage's rootfs dir on
+# stdout, or return 1 if no such stage was built. Reads $WORK/built.
+resolve_from() {
+	_t=$1
+	case $_t in
+		''|*[!0-9]*)   # a stage name (case-insensitive)
+			_u=$(printf '%s' "$_t" | tr '[:lower:]' '[:upper:]')
+			while IFS="$SEP" read -r _bi _bn _br; do
+				[ -n "$_bn" ] || continue
+				_bu=$(printf '%s' "$_bn" | tr '[:lower:]' '[:upper:]')
+				[ "$_bu" = "$_u" ] && { printf '%s' "$_br"; return 0; }
+			done < "$WORK/built"
+			return 1 ;;
+		*)             # a numeric stage index
+			_r=$(awk -F"$SEP" -v n="$_t" '$1==n{print $3}' "$WORK/built")
+			[ -n "$_r" ] && { printf '%s' "$_r"; return 0; }
+			return 1 ;;
+	esac
+}
+
+# Apply one stage's instructions. $1 = lines file, $2 = rootfs dir, $3 = the
+# stage's (mutable) image config blob. Binds are always torn down before return.
+apply_stage() {
+	_lines=$1; ROOTFS=$2; CONFIG_BLOB=$3
 	command -v chroot >/dev/null 2>&1 || die "chroot not found (needed for Dockerfile RUN)"
-
-	cp "$CONFIG_BLOB" "$WORK/image-config.mut.json"
-	CONFIG_BLOB="$WORK/image-config.mut.json"
-	cfg_jq() { jq "$@" "$CONFIG_BLOB" > "$WORK/.cfg" && mv "$WORK/.cfg" "$CONFIG_BLOB"; }
-
 	DF_WD=$(jq -r '.config.WorkingDir // "/"' "$CONFIG_BLOB"); [ -n "$DF_WD" ] || DF_WD=/
 	DF_ENV=""   # "export K=V; " prefix applied to each RUN
-
-	mnt_up() {
-		mkdir -p "$ROOTFS/proc" "$ROOTFS/dev" "$ROOTFS/sys" "$ROOTFS/etc"
-		mount -o bind /proc "$ROOTFS/proc" 2>/dev/null || die "cannot bind /proc into rootfs (need root)"
-		mount -o bind /dev  "$ROOTFS/dev"  2>/dev/null || true
-		mount -o bind /sys  "$ROOTFS/sys"  2>/dev/null || true
-		[ -f /etc/resolv.conf ] && cp -L /etc/resolv.conf "$ROOTFS/etc/resolv.conf" 2>/dev/null || true
-	}
-	mnt_down() { for _m in proc dev sys; do umount "$ROOTFS/$_m" 2>/dev/null || true; done; }
-
-	# logical lines: drop full-line comments, join backslash continuations
-	grep -vE '^[[:space:]]*#' "$DOCKERFILE" | awk '
-		function emit(s){ sub(/^[ \t]+/,"",s); sub(/[ \t]+$/,"",s); if(s!="") print s }
-		{ sub(/\r$/,""); l=$0; if(buf!=""){ l=buf " " l; buf="" }
-		  if(l ~ /\\[ \t]*$/){ sub(/\\[ \t]*$/,"",l); buf=l; next } emit(l) }
-		END{ if(buf!="") emit(buf) }' > "$WORK/df.lines"
-
 	mnt_up
 	while IFS= read -r dl; do
 		[ -n "$dl" ] || continue
 		kw=$(printf '%s' "$dl" | awk '{print toupper($1)}')
 		arg=$(printf '%s' "$dl" | sed 's/^[^[:space:]]*[[:space:]]*//')
 		case $kw in
-			FROM) ;;   # base, already pulled
+			FROM) ;;   # stage delimiter, not part of a stage body
 			RUN)
 				log "  RUN $arg"
 				chroot "$ROOTFS" /bin/sh -c "${DF_ENV}cd \"$DF_WD\" 2>/dev/null || true
@@ -536,19 +517,30 @@ $arg" || { mnt_down; die "RUN failed: $arg"; }
 				;;
 			COPY|ADD)
 				set -- $arg
-				while [ $# -gt 1 ]; do case $1 in --*) shift ;; *) break ;; esac; done
+				_from=""
+				while [ $# -gt 1 ]; do
+					case $1 in
+						--from=*) _from=${1#--from=}; shift ;;
+						--*)      shift ;;
+						*)        break ;;
+					esac
+				done
 				[ $# -ge 2 ] || { mnt_down; die "$kw needs <src>... <dst>: $dl"; }
 				eval "dst=\${$#}"
 				ddst="$ROOTFS/$dst"
 				case $dst in */) mkdir -p "$ddst" ;; *) mkdir -p "$(dirname "$ddst")" ;; esac
-				i=1
+				_srcroot="$CONTEXT"
+				if [ -n "$_from" ]; then
+					_srcroot=$(resolve_from "$_from") || { mnt_down; die "$kw --from=$_from: no such stage (external-image --from is not supported)"; }
+				fi
+				_n=1
 				for s in "$@"; do
-					if [ "$i" -lt "$#" ]; then
-						cp -a "$CONTEXT/$s" "$ddst" || { mnt_down; die "$kw: cannot copy $s"; }
+					if [ "$_n" -lt "$#" ]; then
+						cp -a "$_srcroot/$s" "$ddst" || { mnt_down; die "$kw: cannot copy $s"; }
 					fi
-					i=$((i+1))
+					_n=$((_n+1))
 				done
-				log "  $kw -> $dst"
+				log "  $kw${_from:+ --from=$_from} -> $dst"
 				;;
 			ENV)
 				case $arg in
@@ -576,9 +568,169 @@ $arg" || { mnt_down; die "RUN failed: $arg"; }
 				vlog "($kw ignored)" ;;
 			*) log "  WARNING: unknown Dockerfile instruction ignored: $kw" ;;
 		esac
-	done < "$WORK/df.lines"
+	done < "$_lines"
 	mnt_down
-	log "==> dockerfile build complete"
+}
+
+# ===========================================================================
+#  build
+# ===========================================================================
+
+# default name: the build-context dir in Dockerfile mode (the base image name
+# would be wrong), else the image repo basename.
+if [ -z "$DOCKERFILE" ]; then parse_ref "$REF"; SOURCE="$REG/$REPO:$TAG"; fi
+if [ -z "$NAME" ]; then
+	if [ -n "$DOCKERFILE" ]; then NAME=$(basename -- "$(cd "$CONTEXT" && pwd)"); else NAME=${REPO##*/}; fi
+fi
+[ -n "$OUT" ]  || OUT="./$NAME"
+
+log "==> arch:     $ARCH"
+log "==> bundle:   $OUT  (name: $NAME)"
+[ -z "$DOCKERFILE" ] && log "==> image:    $REG/$REPO ${DIGEST:+@$DIGEST}${DIGEST:+ }${DIGEST:-:$TAG}"
+
+WORK=$(mktemp -d)
+# Unmount any Dockerfile-build binds BEFORE removing $WORK - otherwise rm -rf
+# would recurse into bind-mounted /proc, /dev, /sys (i.e. the host's!). With
+# multi-stage there can be several stage rootfs dirs, so umount them all.
+cleanup() {
+	for _r in "$WORK/rootfs" "$WORK"/stage.*/rootfs; do
+		[ -d "$_r" ] || continue
+		for _m in proc dev sys; do umount "$_r/$_m" 2>/dev/null || true; done
+	done
+	rm -rf "$WORK"
+}
+trap cleanup EXIT INT TERM
+
+# --resolve-digest: print the digest the ref resolves to (manifest-only, no
+# blobs) and stop. Used by uxcd's update check; logs go to stderr so stdout is
+# just the digest. Pull mode only (a build has no single "image" digest).
+if [ "$RESOLVE_ONLY" -eq 1 ]; then
+	[ -n "$DOCKERFILE" ] && die "--resolve-digest is for image pulls, not Dockerfile builds"
+	get_token
+	http_get "https://$APIHOST/v2/$REPO/manifests/$REFDESC" "$WORK/idx.json" \
+		--header="Accept: $ACCEPT_MANIFEST" || die "failed to fetch manifest"
+	printf 'sha256:%s\n' "$(sha256sum "$WORK/idx.json" | awk '{print $1}')"
+	exit 0
+fi
+
+# field separator for the stage tables: US (0x1f), a non-whitespace byte so that
+# `read` keeps empty fields (an unnamed stage's name) instead of collapsing tabs.
+SEP=$(printf '\037')
+
+if [ -n "$DOCKERFILE" ]; then
+	# ---- multi-stage Dockerfile build ----
+	log "==> dockerfile: $DOCKERFILE (context: $CONTEXT)"
+
+	# logical lines: drop full-line comments, join backslash continuations
+	grep -vE '^[[:space:]]*#' "$DOCKERFILE" | awk '
+		function emit(s){ sub(/^[ \t]+/,"",s); sub(/[ \t]+$/,"",s); if(s!="") print s }
+		{ sub(/\r$/,""); l=$0; if(buf!=""){ l=buf " " l; buf="" }
+		  if(l ~ /\\[ \t]*$/){ sub(/\\[ \t]*$/,"",l); buf=l; next } emit(l) }
+		END{ if(buf!="") emit(buf) }' > "$WORK/df.lines"
+
+	# segment logical lines into stages: writes $WORK/stages (idx<TAB>name<TAB>ref
+	# <TAB>baseidx), per-stage instruction files $WORK/stage.<idx>.lines, the stage
+	# count, and $WORK/lastuse (idx<TAB>last-consumer-idx) for eager rootfs freeing.
+	awk -v work="$WORK" -v sep="$SEP" '
+		BEGIN { OFS = sep; ns = 0 }
+		{
+			n = split($0, w)
+			kw = toupper(w[1])
+			if (kw == "FROM") {
+				ref=""; name=""
+				for (i=2; i<=n; i++) {
+					if (w[i] ~ /^--/) continue
+					if (ref=="") { ref=w[i]; continue }
+					if (toupper(w[i])=="AS" && (i+1)<=n) { name=w[i+1]; break }
+				}
+				if (ref=="") { print "FROM needs an image or stage name: " $0 > (work "/parse.err"); exit 2 }
+				base=-1
+				for (k=0; k<ns; k++) if (sname[k]!="" && toupper(sname[k])==toupper(ref)) { base=k; break }
+				if (base>=0) lastuse[base]=ns
+				sname[ns]=name
+				print ns, name, ref, base >> (work "/stages")
+				curfile = work "/stage." ns ".lines"
+				ns++
+				next
+			}
+			if (ns==0) { print "Dockerfile instruction before the first FROM: " $0 > (work "/parse.err"); exit 2 }
+			if (kw=="COPY" || kw=="ADD") {
+				for (i=2; i<=n; i++) {
+					if (w[i] ~ /^--from=/) {
+						t = substr(w[i], 8); ki = -1
+						if (t ~ /^[0-9]+$/) ki = t+0
+						else { for (k=0;k<ns;k++) if (sname[k]!="" && toupper(sname[k])==toupper(t)) { ki=k; break } }
+						if (ki>=0) lastuse[ki] = ns-1
+					} else if (w[i] !~ /^--/) break
+				}
+			}
+			print $0 >> curfile
+		}
+		END {
+			print ns+0 > (work "/nstages")
+			for (j=0; j<ns; j++) print j, (j in lastuse ? lastuse[j] : -1) >> (work "/lastuse")
+		}' "$WORK/df.lines" || true
+	[ -f "$WORK/parse.err" ] && die "$(cat "$WORK/parse.err")"
+	NSTAGES=$(cat "$WORK/nstages" 2>/dev/null || echo 0)
+	[ "$NSTAGES" -ge 1 ] || die "no FROM instruction in $DOCKERFILE"
+	log "==> $NSTAGES stage(s)"
+
+	STAGE_LAST=$((NSTAGES - 1))
+	: > "$WORK/built"
+
+	while IFS="$SEP" read -r i sname sref sbase; do
+		[ -n "$i" ] || continue
+		sdir="$WORK/stage.$i"; mkdir -p "$sdir"; scfg="$sdir/config"
+		if [ "$i" -eq "$STAGE_LAST" ]; then srfs="$WORK/rootfs"; else srfs="$sdir/rootfs"; fi
+		mkdir -p "$srfs"
+		log "==> stage $((i+1))/$NSTAGES${sname:+ ($sname)}: FROM $sref"
+
+		if [ "$sbase" -ge 0 ]; then
+			# base is an earlier stage: clone its rootfs + inherit its (built) config
+			bdir=$(awk -F"$SEP" -v n="$sbase" '$1==n{print $3}' "$WORK/built")
+			[ -n "$bdir" ] || die "stage $((i+1)): base stage rootfs missing"
+			cp -a "$bdir/." "$srfs/" || die "stage $((i+1)): cannot clone base stage rootfs"
+			cp "$WORK/stage.$sbase/config"        "$scfg"             || die "stage $((i+1)): cannot inherit base config"
+			cp "$WORK/stage.$sbase/manifest.json" "$sdir/manifest.json" 2>/dev/null || true
+			cp "$WORK/stage.$sbase/source"        "$sdir/source"      2>/dev/null || true
+			cp "$WORK/stage.$sbase/cfgdigest"     "$sdir/cfgdigest"   2>/dev/null || true
+		else
+			pull_base "$sref" "$srfs"
+			cp "$CONFIG_BLOB" "$scfg"                      # per-stage mutable image config
+			cp "$WORK/manifest.json" "$sdir/manifest.json"
+			printf '%s\n' "$REG/$REPO:$TAG" > "$sdir/source"
+			printf '%s\n' "$CONFIG_DIGEST"  > "$sdir/cfgdigest"
+		fi
+
+		[ -f "$WORK/stage.$i.lines" ] && apply_stage "$WORK/stage.$i.lines" "$srfs" "$scfg"
+		printf '%s\037%s\037%s\n' "$i" "$sname" "$srfs" >> "$WORK/built"
+
+		# eager free: drop earlier intermediate stage rootfs whose last consumer was this stage
+		while IFS="$SEP" read -r lj lu; do
+			[ -n "$lj" ] || continue
+			{ [ "$lj" -lt "$i" ] && [ "$lj" -ne "$STAGE_LAST" ] && [ "$lu" -le "$i" ]; } || continue
+			_fr="$WORK/stage.$lj/rootfs"
+			[ -d "$_fr" ] || continue
+			for _m in proc dev sys; do umount "$_fr/$_m" 2>/dev/null || true; done
+			rm -rf "$_fr"
+		done < "$WORK/lastuse"
+	done < "$WORK/stages"
+
+	ROOTFS="$WORK/rootfs"
+	CONFIG_BLOB="$WORK/stage.$STAGE_LAST/config"
+	SOURCE=$(cat "$WORK/stage.$STAGE_LAST/source" 2>/dev/null || echo "")
+	CONFIG_DIGEST=$(cat "$WORK/stage.$STAGE_LAST/cfgdigest" 2>/dev/null || echo "")
+	cp "$WORK/stage.$STAGE_LAST/manifest.json" "$WORK/manifest.json" 2>/dev/null || true
+	log "==> dockerfile build complete ($NSTAGES stage(s))"
+else
+	# ---- plain image pull ----
+	ROOTFS="$WORK/rootfs"; mkdir -p "$ROOTFS"
+	log "==> resolving + pulling $REF"
+	pull_base "$REF" "$ROOTFS"
+	# provenance: the digest this ref resolved to lets uxcd re-resolve + detect updates
+	PROV_IMAGE=$REF
+	PROV_DIGEST="sha256:$INDEX_SHA"
+	log "==> flattened into rootfs"
 fi
 
 # --------------------------------------------------- image config -> runtime ---
@@ -807,7 +959,7 @@ write_notes() {
 	{
 		echo "# $NAME - generated by docker2uxc $VERSION"
 		echo
-		echo "Source image : $REG/$REPO:$TAG ($ARCH)"
+		echo "Source image : $SOURCE ($ARCH)"
 		echo "Config digest: $CONFIG_DIGEST"
 		echo
 		echo "## Entrypoint / Cmd"

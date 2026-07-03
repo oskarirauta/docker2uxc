@@ -9,6 +9,7 @@
 #include <vector>
 #include <cctype>
 #include <cerrno>
+#include <cstdlib>
 #include <unistd.h>
 #include <signal.h>
 #include <sys/wait.h>
@@ -201,34 +202,97 @@ bool set_cmd_like(JSON& cfg, const char* field, const std::string& kw, const std
 	return true;
 }
 
-} // anonymous namespace
-
-std::string parse_from(const std::string& dockerfile_path, std::string& err) {
-	err.clear();
-	std::vector<std::string> lines = read_logical_lines(dockerfile_path, err);
-	if ( !err.empty()) return "";
-
-	std::string ref;
-	int from_count = 0;
-	for ( const std::string& l : lines ) {
-		std::vector<std::string> tk = split_ws(l);
-		if ( tk.empty() || upper(tk[0]) != "FROM" ) continue;
-		if ( ++from_count > 1 ) { err = "multi-stage builds are not supported (single FROM only)"; return ""; }
-		for ( std::vector<std::string>::size_type i = 1; i < tk.size(); ++i ) {
-			if ( tk[i].rfind("--", 0) == 0 ) continue;          // --platform=... etc.
-			if ( ref.empty()) { ref = tk[i]; continue; }
-			if ( upper(tk[i]) == "AS" ) { err = "multi-stage builds are not supported (single FROM only)"; return ""; }
-		}
+// If `dl` is a COPY/ADD with a --from= flag, return its value; else "".
+std::string copy_from_token(const std::string& dl) {
+	std::vector<std::string> tk = split_ws(dl);
+	if ( tk.empty()) return "";
+	std::string kw = upper(tk[0]);
+	if ( kw != "COPY" && kw != "ADD" ) return "";
+	for ( std::vector<std::string>::size_type i = 1; i < tk.size(); ++i ) {
+		if ( tk[i].rfind("--from=", 0) == 0 ) return tk[i].substr(7);
+		if ( tk[i].rfind("--", 0) != 0 ) break;   // first non-flag token = a source
 	}
-	if ( ref.empty()) { err = "no FROM instruction in " + dockerfile_path; return ""; }
-	return ref;
+	return "";
 }
 
-bool apply(const std::string& dockerfile_path, const std::string& context_dir,
-           const std::string& rootfs_dir, const std::string& config_path, std::string& err) {
+// Resolve a --from= token (stage name or numeric index) to a built stage's rootfs
+// dir, or nullptr if no such stage was built.
+const std::string* resolve_built(const std::vector<BuiltStage>& built, const std::string& tok) {
+	if ( tok.empty()) return nullptr;
+	if ( tok.find_first_not_of("0123456789") == std::string::npos ) {
+		long idx = strtol(tok.c_str(), nullptr, 10);
+		for ( const BuiltStage& b : built ) if ( b.index == (int)idx ) return &b.rootfs_dir;
+		return nullptr;
+	}
+	std::string u = upper(tok);
+	for ( const BuiltStage& b : built ) if ( !b.name.empty() && upper(b.name) == u ) return &b.rootfs_dir;
+	return nullptr;
+}
+
+} // anonymous namespace
+
+bool parse_stages(const std::string& dockerfile_path, std::vector<Stage>& out, std::string& err) {
+	err.clear();
+	out.clear();
+	std::vector<std::string> lines = read_logical_lines(dockerfile_path, err);
+	if ( !err.empty()) return false;
+
+	for ( const std::string& l : lines ) {
+		std::vector<std::string> tk = split_ws(l);
+		if ( tk.empty()) continue;
+		if ( upper(tk[0]) == "FROM" ) {
+			Stage st;
+			std::vector<std::string> words;   // the non-flag words after FROM
+			for ( std::vector<std::string>::size_type i = 1; i < tk.size(); ++i ) {
+				if ( tk[i].rfind("--", 0) == 0 ) continue;   // --platform=... etc.
+				words.push_back(tk[i]);
+			}
+			if ( words.empty()) { err = "FROM needs an image or stage name: " + l; return false; }
+			st.base_ref = words[0];
+			if ( words.size() >= 3 && upper(words[1]) == "AS" ) st.name = words[2];
+			else if ( words.size() >= 2 ) { err = "FROM: expected 'AS <name>' after the base: " + l; return false; }
+			std::string u = upper(st.base_ref);   // stage names match case-insensitively
+			for ( std::vector<Stage>::size_type k = 0; k < out.size(); ++k )
+				if ( !out[k].name.empty() && upper(out[k].name) == u ) { st.base_stage = (int)k; break; }
+			out.push_back(st);
+		} else {
+			if ( out.empty()) { err = "Dockerfile instruction before the first FROM: " + l; return false; }
+			out.back().lines.push_back(l);
+		}
+	}
+	if ( out.empty()) { err = "no FROM instruction in " + dockerfile_path; return false; }
+	return true;
+}
+
+std::vector<int> stage_last_use(const std::vector<Stage>& stages) {
+	std::vector<int> last(stages.size(), -1);
+	auto index_of = [&](const std::string& tok) -> int {
+		if ( tok.empty()) return -1;
+		if ( tok.find_first_not_of("0123456789") == std::string::npos ) {
+			long idx = strtol(tok.c_str(), nullptr, 10);
+			return ( idx >= 0 && (std::vector<Stage>::size_type)idx < stages.size()) ? (int)idx : -1;
+		}
+		std::string u = upper(tok);
+		for ( std::vector<Stage>::size_type k = 0; k < stages.size(); ++k )
+			if ( !stages[k].name.empty() && upper(stages[k].name) == u ) return (int)k;
+		return -1;
+	};
+	for ( std::vector<Stage>::size_type i = 0; i < stages.size(); ++i ) {
+		if ( stages[i].base_stage >= 0 ) last[stages[i].base_stage] = (int)i;
+		for ( const std::string& dl : stages[i].lines ) {
+			int k = index_of(copy_from_token(dl));
+			if ( k >= 0 ) last[k] = (int)i;
+		}
+	}
+	return last;
+}
+
+bool apply_stage(const Stage& stage, const std::string& context_dir,
+                 const std::string& rootfs_dir, const std::string& config_path,
+                 const std::vector<BuiltStage>& built, std::string& err) {
 	err.clear();
 
-	// load the base image config (mutated in place by ENV/WORKDIR/USER/CMD/ENTRYPOINT)
+	// load the stage's base image config (mutated in place by ENV/WORKDIR/USER/CMD/ENTRYPOINT)
 	JSON blob;
 	{
 		std::ifstream f(config_path);
@@ -245,13 +309,10 @@ bool apply(const std::string& dockerfile_path, const std::string& context_dir,
 		df_wd = cfg["WorkingDir"].to_string();
 	std::string df_env;   // accumulated "export K=\"V\"; " prefix applied to each RUN
 
-	std::vector<std::string> lines = read_logical_lines(dockerfile_path, err);
-	if ( !err.empty()) return false;
-
 	Mounts mnt(rootfs_dir);   // RAII: unmounts on every return path below
 	if ( !mnt.ok ) { err = mnt.err; return false; }
 
-	for ( const std::string& dl : lines ) {
+	for ( const std::string& dl : stage.lines ) {
 		if ( work::cancelled ) { err = "cancelled"; return false; }
 		std::vector<std::string> tk = split_ws(dl);
 		if ( tk.empty()) continue;
@@ -259,7 +320,7 @@ bool apply(const std::string& dockerfile_path, const std::string& context_dir,
 		std::string arg = after_first_word(dl);
 
 		if ( kw == "FROM" ) {
-			// base image, already pulled
+			continue;   // stage delimiter, not part of a stage body
 
 		} else if ( kw == "RUN" ) {
 			logger::info << "  RUN " << arg << std::endl;
@@ -272,18 +333,28 @@ bool apply(const std::string& dockerfile_path, const std::string& context_dir,
 
 		} else if ( kw == "COPY" || kw == "ADD" ) {
 			std::vector<std::string> t = split_ws(arg);
+			std::string from_tok;
 			std::vector<std::string>::size_type start = 0;
-			while ( t.size() - start > 1 && t[start].rfind("--", 0) == 0 ) ++start;   // skip --flags
+			while ( t.size() - start > 1 && t[start].rfind("--", 0) == 0 ) {
+				if ( t[start].rfind("--from=", 0) == 0 ) from_tok = t[start].substr(7);
+				++start;   // skip --from=/--chown=/--chmod= etc.
+			}
 			if ( t.size() - start < 2 ) { err = kw + " needs <src>... <dst>: " + dl; return false; }
+			std::string src_root = context_dir;
+			if ( !from_tok.empty()) {
+				const std::string* r = resolve_built(built, from_tok);
+				if ( !r ) { err = kw + " --from=" + from_tok + ": no such stage (external-image --from is not supported)"; return false; }
+				src_root = *r;
+			}
 			const std::string& dst = t.back();
 			std::string ddst = rootfs_dir + "/" + dst;
 			if ( !dst.empty() && dst.back() == '/' ) mkdir_p(ddst);
 			else mkdir_p(dirname_of(ddst));
 			for ( std::vector<std::string>::size_type j = start; j + 1 < t.size(); ++j ) {
 				std::string cerr;
-				if ( !run_cp(context_dir + "/" + t[j], ddst, cerr)) { err = kw + ": cannot copy " + t[j] + " (" + cerr + ")"; return false; }
+				if ( !run_cp(src_root + "/" + t[j], ddst, cerr)) { err = kw + ": cannot copy " + t[j] + " (" + cerr + ")"; return false; }
 			}
-			logger::info << "  " << kw << " -> " << dst << std::endl;
+			logger::info << "  " << kw << ( from_tok.empty() ? std::string() : ( " --from=" + from_tok )) << " -> " << dst << std::endl;
 
 		} else if ( kw == "ENV" ) {
 			std::string k, v;
