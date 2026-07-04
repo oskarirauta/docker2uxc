@@ -11,6 +11,14 @@ bool resolve(const ImageRef& ref, const std::string& arch_base, const std::strin
 	if ( !registry::fetch_manifest(ref, auth_file, body, err)) return false;
 	out.provenance_digest = "sha256:" + sha256_hex(body);   // digest of the ref-resolved manifest
 
+	// A digest-pinned ref (image@sha256:...) must hash to exactly that digest,
+	// else a compromised/hostile registry could serve an arbitrary manifest for
+	// the pin and everything downstream would still "verify" against it.
+	if ( !ref.digest.empty() && out.provenance_digest != ref.digest ) {
+		err = "manifest digest mismatch: pinned " + ref.digest + ", got " + out.provenance_digest;
+		return false;
+	}
+
 	try {
 		JSON m = JSON::parse(body);
 		std::string mt = m.contains("mediaType") ? m["mediaType"].to_string() : "";
@@ -47,6 +55,11 @@ bool resolve(const ImageRef& ref, const std::string& arch_base, const std::strin
 			ImageRef r2 = ref;
 			r2.digest = sub;   // fetch the selected manifest by digest
 			if ( !registry::fetch_manifest(r2, auth_file, body, err)) return false;
+			std::string got = "sha256:" + sha256_hex(body);   // the index pointed us at 'sub'; verify
+			if ( got != sub ) {
+				err = "sub-manifest digest mismatch: expected " + sub + ", got " + got;
+				return false;
+			}
 			m = JSON::parse(body);
 		}
 

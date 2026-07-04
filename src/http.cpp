@@ -70,6 +70,7 @@ bool get(const std::string& url, const std::vector<std::string>& extra, Response
 
 	curl_easy_setopt(c, CURLOPT_URL, url.c_str());
 	curl_easy_setopt(c, CURLOPT_FOLLOWLOCATION, 1L);
+	curl_easy_setopt(c, CURLOPT_REDIR_PROTOCOLS_STR, "https");   // registries redirect blobs; never follow one to http:// (SSRF/downgrade)
 	curl_easy_setopt(c, CURLOPT_NOPROGRESS, 0L);
 	curl_easy_setopt(c, CURLOPT_XFERINFOFUNCTION, xfer_cb);   // libcurl strips Authorization on cross-origin redirect
 	curl_easy_setopt(c, CURLOPT_MAXREDIRS, 8L);
@@ -101,6 +102,7 @@ bool get_to_file(const std::string& url, const std::vector<std::string>& extra, 
 
 	curl_easy_setopt(c, CURLOPT_URL, url.c_str());
 	curl_easy_setopt(c, CURLOPT_FOLLOWLOCATION, 1L);
+	curl_easy_setopt(c, CURLOPT_REDIR_PROTOCOLS_STR, "https");   // registries redirect blobs; never follow one to http:// (SSRF/downgrade)
 	curl_easy_setopt(c, CURLOPT_NOPROGRESS, 0L);
 	curl_easy_setopt(c, CURLOPT_XFERINFOFUNCTION, xfer_cb);
 	curl_easy_setopt(c, CURLOPT_MAXREDIRS, 8L);

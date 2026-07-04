@@ -199,7 +199,13 @@ static void clear_dir(int dfd) {
 static bool write_file_at(int pfd, const std::string& base, FILE* tar, unsigned long long size, mode_t mode) {
 	unlinkat(pfd, base.c_str(), 0);   // drop any existing symlink/file (overlay: layer replaces)
 	int fd = openat(pfd, base.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_NOFOLLOW, mode & 0777);
-	if ( fd < 0 ) return false;
+	if ( fd < 0 ) {
+		// consume the entry's data + padding anyway, otherwise the caller's
+		// `continue` leaves the tar stream misaligned (payload read as a header)
+		unsigned long long skip = size + (512 - (size % 512)) % 512;
+		std::fseek(tar, (long)skip, SEEK_CUR);
+		return false;
+	}
 	unsigned long long left = size;
 	char buf[65536];
 	bool ok = true;
@@ -234,10 +240,24 @@ static std::string pax_get(const std::string& rec, const std::string& key) {
 }
 
 static std::string read_data(FILE* f, unsigned long long size) {
+	unsigned long long pad = (512 - (size % 512)) % 512;
+	// GNU long-name/link and PAX records are a few KB; a huge size is a crafted or
+	// corrupt layer. Never resize() to an attacker-controlled length (OOM / throw) -
+	// discard the record in bounded chunks so the tar stream stays aligned.
+	if ( size > (1ULL << 20) ) {
+		char skip[4096];
+		unsigned long long left = size + pad;
+		while ( left ) {
+			size_t chunk = left < sizeof(skip) ? (size_t)left : sizeof(skip);
+			size_t got = std::fread(skip, 1, chunk, f);
+			if ( !got ) break;   // EOF/error: extraction ends upstream
+			left -= got;
+		}
+		return "";
+	}
 	std::string s;
 	s.resize(size);
 	if ( size && std::fread(&s[0], 1, size, f) != size ) s.clear();
-	unsigned long long pad = (512 - (size % 512)) % 512;
 	if ( pad ) std::fseek(f, (long)pad, SEEK_CUR);
 	return s;
 }
