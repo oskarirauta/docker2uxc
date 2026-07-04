@@ -17,10 +17,22 @@ static const char* CAPS_PERMISSIVE[] = {
 static const char* CAPS_MINIMAL[] = {
 	"CAP_CHOWN","CAP_DAC_OVERRIDE","CAP_FOWNER","CAP_SETGID","CAP_SETUID","CAP_NET_BIND_SERVICE","CAP_KILL", nullptr
 };
+// Default for a converted image: the common runtime caps WITHOUT the ones that let
+// a container reach past its namespace into the host - CAP_NET_ADMIN (flush
+// fw4/nftables in host-net mode), SYS_PTRACE, MKNOD, DAC_READ_SEARCH, SYS_RESOURCE,
+// IPC_LOCK. The broad set stays available via --caps permissive / --privileged.
+static const char* CAPS_DEFAULT[] = {
+	"CAP_CHOWN","CAP_DAC_OVERRIDE","CAP_FOWNER","CAP_FSETID","CAP_KILL",
+	"CAP_SETGID","CAP_SETUID","CAP_SETPCAP","CAP_NET_BIND_SERVICE","CAP_NET_RAW",
+	"CAP_SYS_CHROOT","CAP_AUDIT_WRITE","CAP_SETFCAP","CAP_SYS_NICE", nullptr
+};
 
 static JSON caps_array(const std::string& set) {
+	const char** p = ( set == "minimal" )    ? CAPS_MINIMAL
+	               : ( set == "permissive" ) ? CAPS_PERMISSIVE
+	               :                           CAPS_DEFAULT;   // no host-affecting caps
 	JSON a = JSON::Array();
-	for ( const char** p = ( set == "minimal" ) ? CAPS_MINIMAL : CAPS_PERMISSIVE; *p; ++p )
+	for ( ; *p; ++p )
 		a.append(JSON(std::string(*p)));
 	return a;
 }

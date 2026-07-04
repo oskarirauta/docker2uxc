@@ -43,7 +43,11 @@ JSON deepmerge(const JSON& a, const JSON& b) {
 		for ( auto it = b.begin(); it != b.end(); ++it ) {
 			std::string k = it.key();
 			JSON bv = it.value();
-			if ( !r.contains(k) || r[k].type() == JSON::TYPE::NULLPTR ) r[k] = bv;
+			// OCI capability sets REPLACE, not concatenate, so a profile can scope
+			// caps DOWN (e.g. frigate -> just CAP_SYS_ADMIN), not only ever widen them.
+			bool cap_set = ( k == "bounding" || k == "effective" || k == "permitted" ||
+			                 k == "inheritable" || k == "ambient" );
+			if ( !r.contains(k) || r[k].type() == JSON::TYPE::NULLPTR || cap_set ) r[k] = bv;
 			else r[k] = deepmerge(r[k], bv);
 		}
 		return r;
