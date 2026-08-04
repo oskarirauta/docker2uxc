@@ -43,7 +43,9 @@ int main(int argc, char** argv) {
 			{ "no-accounting",  {             .word = "no-accounting",  .desc = "omit the memory+pids linux.resources block" }},
 			{ "no-verify",      {             .word = "no-verify",      .desc = "skip sha256 verification of downloaded blobs" }},
 			{ "cache",          {             .word = "cache",          .desc = "blob cache directory (default /tmp/docker2uxc-cache)", .flag = usage_t::REQUIRED, .name = "dir" }},
-			{ "rw-overlay",     {             .word = "rw-overlay",     .desc = "tune config for a writable overlay" }},
+			{ "rw-overlay",     {             .word = "rw-overlay",     .desc = "writable rootfs via a persistent overlay (base image stays pristine)" }},
+			{ "dev",            {             .word = "dev",            .desc = "dev container: idle cntrinit init + writable overlay (shell in with uxe)" }},
+			{ "cntrinit",       {             .word = "cntrinit",       .desc = "cntrinit binary to stage for --dev (default /usr/bin/cntrinit)", .flag = usage_t::REQUIRED, .name = "path" }},
 			{ "autostart",      {             .word = "autostart",      .desc = "register the container to start on boot" }},
 			{ "no-register",    {             .word = "no-register",    .desc = "build the bundle only; do not register with uxcd" }},
 			{ "resolve-digest", {             .word = "resolve-digest", .desc = "print the digest the ref resolves to, then exit" }},
@@ -100,7 +102,9 @@ int main(int argc, char** argv) {
 	o.network_isolated = ( (bool)usage["network"] && usage["network"].value == "isolated" );
 	o.resolvconf       = (bool)usage["resolv-conf"];
 	o.accounting       = !(bool)usage["no-accounting"];
-	o.rw_overlay       = (bool)usage["rw-overlay"];
+	o.dev              = (bool)usage["dev"];
+	o.rw_overlay       = (bool)usage["rw-overlay"] || o.dev;
+	if ( (bool)usage["cntrinit"] ) o.cntrinit = usage["cntrinit"].value;
 	if ( (bool)usage["profile"] )  o.profile = usage["profile"].value;
 	o.emit_netconfig   = (bool)usage["emit-netconfig"];
 	if ( (bool)usage["net-bridge"] ) o.net_bridge = usage["net-bridge"].value;

@@ -1,5 +1,6 @@
 #pragma once
 #include <string>
+#include <vector>
 
 namespace bundle {
 
@@ -10,7 +11,7 @@ struct Opts {
 	bool network_isolated = false;      // --network isolated -> own netns
 	bool resolvconf = false;            // --resolv-conf -> bind /etc/resolv.conf
 	bool accounting = true;             // linux.resources memory+pids (cgroup stats)
-	bool rw_overlay = false;            // root.readonly (overlay supplies upper)
+	std::vector<std::string> args_override;  // if set, replaces the image Entrypoint+Cmd (e.g. --dev idle init)
 };
 
 // Build an OCI runtime config.json from the image config blob + opts and write

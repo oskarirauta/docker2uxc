@@ -333,7 +333,15 @@ bool convert(Options& o, std::string& err) {
 	bo.network_isolated = o.network_isolated;
 	bo.resolvconf       = o.resolvconf;
 	bo.accounting       = o.accounting;
-	bo.rw_overlay       = o.rw_overlay;
+	if ( o.dev ) {
+		// dev container: run an idle cntrinit as PID 1 (no child) so a daemonless
+		// image stays "running" and you shell in with `uxe`. Copy the static init
+		// into the bundle rootfs; the trailing "--" puts cntrinit in idle mode.
+		std::string cdst = rootfs + "/.cntrinit";
+		if ( !copy_file(o.cntrinit, cdst)) { err = "dev: cannot copy cntrinit from " + o.cntrinit + " (is the cntrinit package installed?)"; return false; }
+		chmod(cdst.c_str(), 0755);
+		bo.args_override = { "/.cntrinit", "--" };
+	}
 	if ( !bundle::write_config(cfgblob, rootfs, bo, out + "/config.json", err)) { err = "config.json: " + err; return false; }
 
 	if ( !o.profile.empty()) {
@@ -378,7 +386,10 @@ bool convert(Options& o, std::string& err) {
 		// EXPOSE -> web_ports prefill (pull only; a build's EXPOSE is the base image's)
 		JSON web_ports = df_mode ? JSON::Array() : emit::web_ports_from_image(out + "/image-config.json");
 		std::string stop_sig = df_mode ? std::string() : emit::stop_signal_from_image(out + "/image-config.json");
-		if ( !reg::register_container(o.uxc_dir, name, abs_out, prov_image, prov_digest, o.infra, o.autostart, web_ports, stop_sig, err)) { err = "register: " + err; return false; }
+			// --rw-overlay/--dev: persistent, resettable r/w overlay (base rootfs stays pristine)
+			std::string overlay = ( o.rw_overlay || o.dev ) ? abs_out + ".overlay" : std::string();
+			if ( !overlay.empty()) mkdir(overlay.c_str(), 0700);   // ujail -O needs the dir to exist
+		if ( !reg::register_container(o.uxc_dir, name, abs_out, prov_image, prov_digest, o.infra, o.autostart, web_ports, stop_sig, overlay, err)) { err = "register: " + err; return false; }
 		logger::info << "==> registered: " << o.uxc_dir << "/" << name << ".json" << std::endl;
 		if ( web_ports.begin() != web_ports.end())
 			logger::info << "    web UI port(s) detected from EXPOSE - review/label them in LuCI" << std::endl;

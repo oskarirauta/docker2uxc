@@ -122,7 +122,11 @@ bool write_config(const std::string& image_config_blob, const std::string& rootf
 	proc["terminal"] = false;
 	{ JSON u = JSON::Object(); u["uid"] = (long long)uid; u["gid"] = (long long)gid; proc["user"] = u; }
 	proc["cwd"] = cwd;
-	proc["args"] = args;
+	if ( !opts.args_override.empty()) {
+		JSON ov = JSON::Array();
+		for ( const auto& a : opts.args_override ) ov.append(JSON(a));
+		proc["args"] = ov;
+	} else proc["args"] = args;
 	proc["env"] = env;
 	{ JSON caps = JSON::Object(); JSON cs = caps_array(opts.caps);
 	  caps["bounding"] = cs; caps["effective"] = cs; caps["inheritable"] = cs; caps["permitted"] = cs; caps["ambient"] = JSON::Array();
@@ -133,7 +137,7 @@ bool write_config(const std::string& image_config_blob, const std::string& rootf
 	proc["noNewPrivileges"] = opts.nnp;
 	cfg["process"] = proc;
 
-	{ JSON root = JSON::Object(); root["path"] = std::string("rootfs"); root["readonly"] = opts.rw_overlay; cfg["root"] = root; }
+	{ JSON root = JSON::Object(); root["path"] = std::string("rootfs"); root["readonly"] = false; cfg["root"] = root; }
 
 	JSON mounts = JSON::Array();
 	auto add_mount = [&](const char* dest, const char* type, const char* src, std::vector<const char*> o) {

@@ -12,6 +12,7 @@ namespace reg {
 // entry has none - so a manual edit or re-pull never clobbers the user's list.
 bool register_container(const std::string& uxc_dir, const std::string& name, const std::string& abs_out,
                         const std::string& image, const std::string& digest, const std::string& infra,
-                        bool autostart, const JSON& web_ports, const std::string& stop_signal, std::string& err);
+                        bool autostart, const JSON& web_ports, const std::string& stop_signal,
+                        const std::string& write_overlay_path, std::string& err);
 
 }

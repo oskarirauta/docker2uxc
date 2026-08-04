@@ -11,7 +11,8 @@ namespace reg {
 
 bool register_container(const std::string& uxc_dir, const std::string& name, const std::string& abs_out,
                         const std::string& image, const std::string& digest, const std::string& infra,
-                        bool autostart, const JSON& web_ports, const std::string& stop_signal, std::string& err) {
+                        bool autostart, const JSON& web_ports, const std::string& stop_signal,
+                        const std::string& write_overlay_path, std::string& err) {
 	mkdir(uxc_dir.c_str(), 0755);
 	std::string path = uxc_dir + "/" + name + ".json";
 
@@ -39,6 +40,8 @@ bool register_container(const std::string& uxc_dir, const std::string& name, con
 		merged["web_ports"] = web_ports;            // EXPOSE-derived prefill; only when the user has none
 	if ( !stop_signal.empty() && !merged.contains("stop_signal"))
 		merged["stop_signal"] = stop_signal;        // STOPSIGNAL-derived; only when the user has none
+	if ( !write_overlay_path.empty() && !merged.contains("write_overlay_path"))
+		merged["write_overlay_path"] = write_overlay_path;   // persistent r/w overlay; user's value survives a re-pull
 
 	std::string tmp = path + ".tmp";
 	{

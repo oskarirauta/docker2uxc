@@ -33,6 +33,8 @@ struct Options {
 	bool resolvconf       = false;     // bind-mount host /etc/resolv.conf
 	bool accounting       = true;      // memory+pids linux.resources block
 	bool rw_overlay       = false;
+	bool dev              = false;     // dev container: idle cntrinit init + writable persistent overlay
+	std::string cntrinit  = "/usr/bin/cntrinit";  // static init copied into the bundle for --dev
 	std::string profile;               // profiles/<profile>.json overlay
 
 	// optional emitters
