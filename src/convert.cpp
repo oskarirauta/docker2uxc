@@ -246,7 +246,12 @@ bool convert(Options& o, std::string& err) {
 	struct stat ost;
 	bool exists = ( stat(out.c_str(), &ost) == 0 );
 	if ( exists && !o.force ) { err = "output exists: " + out + " (use force)"; return false; }
-	if ( exists ) { rm_rf(out + ".prev"); rename(out.c_str(), ( out + ".prev" ).c_str()); }   // keep one gen for rollback
+	// build into <out>.new and swap into place only when the bundle is COMPLETE:
+	// a cancelled or failed pull must never eat the live bundle or its .prev
+	// backup - they are the rollback safety net for an upgrade re-pull.
+	std::string out_final = out;
+	out = out_final + ".new";
+	rm_rf(out);   // stale leftover from an earlier cancelled/failed run
 
 	work::Dir wd;
 	if ( !wd.ok()) { err = "cannot create work directory"; return false; }
@@ -351,6 +356,15 @@ bool convert(Options& o, std::string& err) {
 
 	copy_file(cfgblob, out + "/image-config.json");
 	write_file_str(out + "/manifest.json", eff_manifest);
+
+	// the new bundle is complete - now (and only now) rotate: live -> .prev,
+	// new -> live. Keeps one generation for rollback, exactly as before.
+	if ( exists ) {
+		rm_rf(out_final + ".prev");
+		if ( rename(out_final.c_str(), ( out_final + ".prev" ).c_str()) != 0 ) { err = "cannot rotate " + out_final + " to .prev"; return false; }
+	}
+	if ( rename(out.c_str(), out_final.c_str()) != 0 ) { err = "cannot move " + out + " into place"; return false; }
+	out = out_final;
 
 	char* orp = realpath(out.c_str(), nullptr);   // PATH_MAX-safe
 	std::string abs_out = orp ? std::string(orp) : out;
