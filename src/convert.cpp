@@ -251,7 +251,8 @@ bool convert(Options& o, std::string& err) {
 	// backup - they are the rollback safety net for an upgrade re-pull.
 	std::string out_final = out;
 	out = out_final + ".new";
-	rm_rf(out);   // stale leftover from an earlier cancelled/failed run
+	rm_rf(out);                          // stale leftovers from an earlier
+	rm_rf(out_final + ".prev.old");      // cancelled/failed/killed run
 
 	work::Dir wd;
 	if ( !wd.ok()) { err = "cannot create work directory"; return false; }
@@ -358,13 +359,18 @@ bool convert(Options& o, std::string& err) {
 	write_file_str(out + "/manifest.json", eff_manifest);
 
 	// the new bundle is complete - now (and only now) rotate: live -> .prev,
-	// new -> live. Keeps one generation for rollback, exactly as before.
+	// new -> live. Renames first (fast, near-atomic), the slow delete of the
+	// old backup LAST under a junk name - so a cancel, kill or power-off at
+	// any instant leaves a consistent live/.prev pair (stray .prev.old/.new
+	// are cleared by the next run).
+	if ( work::cancelled ) { err = "cancelled"; return false; }
 	if ( exists ) {
-		rm_rf(out_final + ".prev");
+		rename(( out_final + ".prev" ).c_str(), ( out_final + ".prev.old" ).c_str());   // may fail: no .prev
 		if ( rename(out_final.c_str(), ( out_final + ".prev" ).c_str()) != 0 ) { err = "cannot rotate " + out_final + " to .prev"; return false; }
 	}
 	if ( rename(out.c_str(), out_final.c_str()) != 0 ) { err = "cannot move " + out + " into place"; return false; }
 	out = out_final;
+	rm_rf(out_final + ".prev.old");
 
 	char* orp = realpath(out.c_str(), nullptr);   // PATH_MAX-safe
 	std::string abs_out = orp ? std::string(orp) : out;
