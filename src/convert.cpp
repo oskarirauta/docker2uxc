@@ -19,6 +19,7 @@
 #include <vector>
 #include <dirent.h>
 #include <sys/utsname.h>
+#include <cctype>
 #include <sys/stat.h>
 #include <sys/wait.h>
 #include <unistd.h>
@@ -153,6 +154,94 @@ std::string resolve_digest(const std::string& image, const std::string& auth_fil
 	return "sha256:" + sha256_hex(body);
 }
 
+// ---- "newer version tag" heuristic ------------------------------------------
+// Parse a tag into (numeric core, family, prerelease). Returns false for tags
+// with no leading version number (latest, stable, mainline-alpine, ...).
+// family "" = a plain version; an alpha/beta/rc/dev suffix is a prerelease of
+// the plain family; ANY other suffix (e.g. "-alpine", "-tensorrt") is its own
+// variant family. Candidates must match the current tag's family, so
+// nginx:1.29-alpine is only ever offered *-alpine tags and frigate:0.17.2
+// never sees -tensorrt builds.
+struct TagVer {
+	std::vector<long> num;      // 0.17.2 -> {0,17,2}
+	std::string family;         // "" plain, else the variant suffix (e.g. "-alpine")
+	bool pre = false;           // prerelease of the plain family
+	int  pre_rank = 0;          // alpha/dev/pre=0  beta=1  rc=2
+	long pre_num  = 0;          // beta2 -> 2
+};
+static bool parse_tagver(const std::string& tag, TagVer& v) {
+	std::string t = tag;
+	if ( !t.empty() && ( t[0] == 'v' || t[0] == 'V' )) t = t.substr(1);
+	std::string::size_type i = 0;
+	while ( i < t.size() && isdigit((unsigned char)t[i])) {
+		std::string::size_type j = i;
+		while ( j < t.size() && isdigit((unsigned char)t[j])) j++;
+		v.num.push_back(atol(t.substr(i, j - i).c_str()));
+		i = j;
+		if ( i + 1 < t.size() && t[i] == '.' && isdigit((unsigned char)t[i + 1])) i++;
+		else break;
+	}
+	if ( v.num.empty()) return false;
+	// an all-digit commit sha ("9950684") is not a version: accept a
+	// single-component number only when it is small (postgres:16 style)
+	if ( v.num.size() == 1 && v.num[0] > 9999 ) return false;
+	std::string rest = t.substr(i);
+	if ( rest.empty()) return true;                    // plain 0.17.2
+	std::string low;
+	for ( char c : rest ) low += (char)tolower((unsigned char)c);
+	std::string::size_type s = ( low[0] == '-' || low[0] == '.' ) ? 1 : 0;
+	static const struct { const char* w; int rank; } P[] =
+		{{ "alpha", 0 }, { "beta", 1 }, { "rc", 2 }, { "dev", 0 }, { "pre", 0 }};
+	for ( const auto& p : P ) {
+		std::string w = p.w;
+		if ( low.compare(s, w.size(), w) == 0 ) {
+			std::string tail = low.substr(s + w.size());
+			if ( !tail.empty() && ( tail[0] == '.' || tail[0] == '-' )) tail = tail.substr(1);
+			if ( tail.find_first_not_of("0123456789") == std::string::npos ) {
+				v.pre = true; v.pre_rank = p.rank;
+				v.pre_num = tail.empty() ? 0 : atol(tail.c_str());
+				return true;
+			}
+		}
+	}
+	v.family = rest;                                   // variant (-alpine, -tensorrt, ...)
+	return true;
+}
+static int cmp_num(const std::vector<long>& a, const std::vector<long>& b) {
+	std::vector<long>::size_type n = a.size() > b.size() ? a.size() : b.size();
+	for ( std::vector<long>::size_type i = 0; i < n; i++ ) {
+		long x = i < a.size() ? a[i] : 0, y = i < b.size() ? b[i] : 0;
+		if ( x != y ) return x < y ? -1 : 1;
+	}
+	return 0;
+}
+static bool tag_newer(const TagVer& a, const TagVer& b) {   // b newer than a? (same family)
+	int c = cmp_num(a.num, b.num);
+	if ( c != 0 ) return c < 0;
+	if ( a.pre != b.pre ) return a.pre && !b.pre;       // same core: a stable beats its prereleases
+	if ( !a.pre ) return false;
+	if ( a.pre_rank != b.pre_rank ) return a.pre_rank < b.pre_rank;
+	return a.pre_num < b.pre_num;
+}
+// The best upgrade-candidate tag newer than `cur`: a stable version if any,
+// else the newest prerelease (frigate publishes betas long before a release).
+// "" when there is nothing newer or `cur` is not version-like.
+static std::string newest_tag(const std::string& cur, const std::vector<std::string>& tags) {
+	TagVer c;
+	if ( !parse_tagver(cur, c)) return "";
+	std::string best_stable, best_pre;
+	TagVer bs = c, bp = c;
+	for ( const std::string& t : tags ) {
+		TagVer v;
+		if ( !parse_tagver(t, v)) continue;
+		if ( v.family != c.family ) continue;
+		if ( v.num.size() == 1 && c.num.size() > 1 ) continue;   // "1234" sha-ish vs a dotted version
+		if ( v.pre ) { if ( c.family.empty() && tag_newer(bp, v)) { bp = v; best_pre = t; } }
+		else         { if ( tag_newer(bs, v)) { bs = v; best_stable = t; } }
+	}
+	return !best_stable.empty() ? best_stable : best_pre;
+}
+
 bool check_updates(const std::string& uxc_dir, const std::string& auth_file, std::string& out, std::string& err) {
 	(void)err;
 	DIR* d = opendir(uxc_dir.c_str());
@@ -182,9 +271,24 @@ bool check_updates(const std::string& uxc_dir, const std::string& auth_file, std
 		if ( image.empty() || old.empty()) continue;
 
 		std::string e2, neu = resolve_digest(image, auth_file, e2);
+
+		// also scan the repo's tags for a newer VERSION (a tag the recorded one
+		// can never "move" to by itself) - reported as an optional 4th column
+		std::string newer;
+		{
+			ImageRef r = parse_ref(image);
+			if ( r.digest.empty() && !r.tag.empty()) {   // a digest-pinned ref has no tag to follow
+				std::vector<std::string> tags;
+				std::string e3;
+				if ( registry::fetch_tags(r, auth_file, tags, e3))
+					newer = newest_tag(r.tag, tags);
+			}
+		}
+		std::string extra = newer.empty() ? std::string() : ( "\t" + newer );
+
 		if      ( neu.empty()) out += n + "\terror\t\n";
-		else if ( neu == old ) out += n + "\tcurrent\t" + neu + "\n";
-		else                   out += n + "\tupdate\t"  + neu + "\n";
+		else if ( neu == old ) out += n + "\tcurrent\t" + neu + extra + "\n";
+		else                   out += n + "\tupdate\t"  + neu + extra + "\n";
 	}
 	return true;
 }

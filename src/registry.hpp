@@ -1,5 +1,6 @@
 #pragma once
 #include <string>
+#include <vector>
 #include "ref.hpp"
 
 namespace registry {
@@ -14,5 +15,10 @@ bool fetch_manifest(const ImageRef& ref, const std::string& auth_file,
 // digest - the caller does. Returns false + err on transport/HTTP failure.
 bool fetch_blob(const ImageRef& ref, const std::string& digest,
                 const std::string& auth_file, const std::string& outfile, std::string& err);
+
+// List the repository's tags (GET /v2/<repo>/tags/list; first page, up to
+// 1000 - enough for a "newer version" scan). Returns false + err.
+bool fetch_tags(const ImageRef& ref, const std::string& auth_file,
+                std::vector<std::string>& tags, std::string& err);
 
 }

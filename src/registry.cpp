@@ -163,6 +163,34 @@ bool fetch_manifest(const ImageRef& ref, const std::string& auth_file, std::stri
 	return true;
 }
 
+bool fetch_tags(const ImageRef& ref, const std::string& auth_file, std::vector<std::string>& tags, std::string& err) {
+	// OCI-spec pagination: ?n=1000, next page via ?last=<final tag received>,
+	// done when a page comes back short. Capped: a repo that publishes every
+	// dev commit (frigate!) holds thousands of tags and the version tags can
+	// sit many pages deep.
+	std::string last;
+	for ( int page = 0; page < 20; page++ ) {
+		std::vector<std::string> headers;
+		if ( !authenticate(ref, auth_file, headers, err)) return false;
+		std::string url = "https://" + ref.apihost + "/v2/" + ref.repo + "/tags/list?n=1000";
+		if ( !last.empty()) url += "&last=" + last;
+		http::Response r;
+		if ( !http::get(url, headers, r, err)) return false;
+		if ( r.status != 200 ) { err = "tags HTTP " + std::to_string(r.status); return false; }
+		std::vector<std::string>::size_type before = tags.size();
+		try {
+			JSON j = JSON::parse(r.body);
+			if ( j.type() == JSON::TYPE::OBJECT && j.contains("tags") && j["tags"].type() == JSON::TYPE::ARRAY )
+				for ( auto it = j["tags"].begin(); it != j["tags"].end(); ++it )
+					tags.push_back(( *it.value()).to_string());
+		} catch ( const std::exception& e ) { err = std::string("tags parse: ") + e.what(); return false; }
+		std::vector<std::string>::size_type got = tags.size() - before;
+		if ( got < 1000 || work::cancelled ) break;   // short page = last page
+		last = tags.back();
+	}
+	return true;
+}
+
 bool fetch_blob(const ImageRef& ref, const std::string& digest, const std::string& auth_file,
                 const std::string& outfile, std::string& err) {
 	if ( !valid_digest(digest)) { err = "invalid blob digest: " + digest; return false; }
