@@ -26,6 +26,7 @@ DOCKER2UXC_OBJS := \
 	objs/d2u_reg.o \
 	objs/d2u_dockerfile.o \
 	objs/d2u_emit.o \
+	objs/d2u_space.o \
 	objs/d2u_convert.o
 
 objs/d2u_ref.o: $(DOCKER2UXC_DIR)/src/ref.cpp
@@ -62,6 +63,9 @@ objs/d2u_dockerfile.o: $(DOCKER2UXC_DIR)/src/dockerfile.cpp
 	$(CXX) $(CXXFLAGS) $(INCLUDES) -c -o $@ $<;
 
 objs/d2u_emit.o: $(DOCKER2UXC_DIR)/src/emit.cpp
+	$(CXX) $(CXXFLAGS) $(INCLUDES) -c -o $@ $<;
+
+objs/d2u_space.o: $(DOCKER2UXC_DIR)/src/space.cpp
 	$(CXX) $(CXXFLAGS) $(INCLUDES) -c -o $@ $<;
 
 objs/d2u_convert.o: $(DOCKER2UXC_DIR)/src/convert.cpp

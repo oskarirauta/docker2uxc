@@ -1,14 +1,28 @@
 {
-  "_comment": "MariaDB / MySQL overlay. Apply with --profile mariadb. Arrays APPEND to the base config; EDIT the data bind 'source' to a host path (it must exist). See profiles/README.md.",
-  "_comment_env": "Set MARIADB_ROOT_PASSWORD (or MARIADB_ALLOW_EMPTY_ROOT_PASSWORD / MARIADB_RANDOM_ROOT_PASSWORD) in the container's registry 'env' - NOT here, this file is shared. TZ is a convenience.",
+  "_description": "MariaDB / MySQL: data bind, shared memory for InnoDB temp tables, and a TCP health check on 3306.",
+
+  "_comment": "EDIT the data volume path below. Set MARIADB_ROOT_PASSWORD (or MARIADB_ALLOW_EMPTY_ROOT_PASSWORD / MARIADB_RANDOM_ROOT_PASSWORD) in the container's registry 'env' - LuCI: Configure -> Environment - NOT in this file, which is shared by every mariadb container.",
+
+  "_comment_caps": "The entrypoint initialises the data dir and then runs mysqld as the 'mysql' user. Listed so the profile also works with --caps minimal.",
+  "_caps_add": [ "CAP_CHOWN", "CAP_FOWNER", "CAP_DAC_OVERRIDE", "CAP_SETUID", "CAP_SETGID" ],
+
   "process": {
-    "env": ["TZ=UTC"]
+    "env": [ "TZ=UTC" ]
   },
-  "_comment_shm": "A little shared memory for the InnoDB / temp tables; raise if you tune the buffer pool high.",
-  "mounts": [
-    { "destination": "/dev/shm", "type": "tmpfs", "source": "tmpfs",
-      "options": ["nosuid", "nodev", "mode=1777", "size=128m"] },
-    { "destination": "/var/lib/mysql", "type": "bind", "source": "/srv/CHANGEME/mariadb",
-      "options": ["rbind", "rw"] }
-  ]
+
+  "_registry": {
+    "_comment_shm": "Raise this if you tune the buffer pool high. It is RAM.",
+    "shm_size": "128m",
+    "_comment_volumes": "EDIT THIS.",
+    "volumes": [ "/srv/mariadb:/var/lib/mysql" ],
+    "healthcheck": {
+      "checks": [ { "type": "tcp", "target": "127.0.0.1:3306" } ],
+      "interval": 30,
+      "retries": 3,
+      "start_period": 45
+    },
+    "respawn": true,
+    "urls": [ "https://hub.docker.com/_/mariadb" ],
+    "notes": "First start initialises the data dir and needs a root-password variable in env. The first initialisation can take a minute - that is what start_period covers."
+  }
 }

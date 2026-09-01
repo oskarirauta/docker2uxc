@@ -1,5 +1,6 @@
 #pragma once
 #include <string>
+#include <vector>
 #include "json.hpp"
 
 namespace reg {
@@ -14,5 +15,12 @@ bool register_container(const std::string& uxc_dir, const std::string& name, con
                         const std::string& image, const std::string& digest, const std::string& infra,
                         bool autostart, const JSON& web_ports, const std::string& stop_signal,
                         const std::string& write_overlay_path, std::string& err);
+
+// Seed the registry entry with a profile's "_registry" block (devices, shm_size,
+// volumes, healthcheck, notes, ...). Only keys the entry does NOT already carry
+// are written, so a re-pull or an upgrade never overwrites what the user tuned
+// by hand or in LuCI. `applied` lists the keys actually seeded.
+bool apply_profile_registry(const std::string& uxc_dir, const std::string& name, const JSON& block,
+                            std::vector<std::string>& applied, std::string& err);
 
 }

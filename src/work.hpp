@@ -16,7 +16,10 @@ void install_signal_handlers();      // SIGTERM/SIGINT -> set cancelled; ignore 
 // host's), then removes the tree. Used for $WORK (and Dockerfile-build later).
 class Dir {
 public:
-	Dir();
+	// `base` = where the scratch dir is created. Empty means $TMPDIR, else /tmp.
+	// It holds one fully DECOMPRESSED layer at a time, so on a box whose /tmp is
+	// a RAM tmpfs the caller should point this at the bundle's storage instead.
+	explicit Dir(const std::string& base = "");
 	~Dir();
 	Dir(const Dir&) = delete;
 	Dir& operator=(const Dir&) = delete;

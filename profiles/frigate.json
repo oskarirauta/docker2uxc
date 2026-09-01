@@ -1,26 +1,54 @@
 {
-  "_comment": "Frigate NVR overlay. EDIT the bind 'source' paths to match your host. See profiles/README.md. shm 'size' scales with camera count/resolution.",
-  "_comment_tz": "Timezone via env (Frigate honors TZ). Bind-mounting /etc/localtime is avoided because OpenWrt usually has no such file, and a missing bind source makes ujail fail the whole container. Set TZ to your zone.",
-  "_comment_devices": "GPU + Coral passthrough goes in the uxcd registry 'devices' field (/etc/uxc/<name>.json), NOT only here: the registry adds the device node AND the cgroup device-allow rule that a bundle mount alone does not grant. Add what you have, e.g. \"devices\": [\"/dev/dri\", \"/dev/apex_0\"] for an M.2/PCIe Coral, or \"/dev/bus/usb\" for a USB Coral (it re-enumerates after firmware upload, so pass the bus). See docs/configuration.md.",
-  "_comment_web_ports": "Frigate's web UI is port 5000. docker2uxc auto-fills it into the registry 'web_ports' from the image's EXPOSE, so the LuCI overview shows a click-through icon - just add a label (e.g. \"Frigate\") there. Ports 8554 (RTSP) and 8555 (WebRTC) are not web UIs and are intentionally left out.",
-  "process": {
-    "env": ["TZ=UTC"],
-    "capabilities": {
-      "bounding":    ["CAP_SYS_ADMIN"],
-      "effective":   ["CAP_SYS_ADMIN"],
-      "permitted":   ["CAP_SYS_ADMIN"],
-      "inheritable": ["CAP_SYS_ADMIN"]
-    }
-  },
-  "_comment_mounts": "EDIT every bind 'source' to your host paths. ALL sources must exist on the host or ujail fails to start the container. /dev/dri is for VAAPI; remove it if the host has no GPU.",
+  "_description": "Frigate NVR: adds the capabilities its s6 init needs, passes through the iGPU and USB Coral, sizes /dev/shm, and pre-fills the health check.",
+
+  "_comment": "EDIT the two volume paths below to your host layout, then `uxc start frigate`. Everything else is meant to work as-is. See profiles/README.md and docs/frigate.md.",
+
+  "_comment_caps": "ADDED on top of the --caps set (never replacing it). Frigate's s6-overlay init chowns /dev/shm/logs and remounts things: with anything less than the full permissive set PLUS these two it dies during startup with 'Operation not permitted'. CAP_SYS_ADMIN = s6 mount work, CAP_PERFMON = hardware-accelerated detectors.",
+  "_caps_add": [ "CAP_SYS_ADMIN", "CAP_PERFMON" ],
+
+
+  "_comment_mounts": "Device pass-through is done in _registry.devices below - that also grants the cgroup device rule, which a bind mount alone does not. The only thing left here is /tmp: Frigate caches models and clips there and the default tmpfs is unbounded (it is RAM).",
   "mounts": [
-    { "destination": "/dev/shm", "type": "tmpfs", "source": "tmpfs",
-      "options": ["nosuid", "nodev", "mode=1777", "size=256m"] },
-    { "destination": "/config", "type": "bind", "source": "/srv/frigate/config",
-      "options": ["rbind", "rw"] },
-    { "destination": "/media", "type": "bind", "source": "/srv/frigate/media",
-      "options": ["rbind", "rw"] },
-    { "destination": "/dev/dri", "type": "bind", "source": "/dev/dri",
-      "options": ["rbind"] }
-  ]
+    { "destination": "/tmp", "type": "tmpfs", "source": "tmpfs",
+      "options": [ "nosuid", "nodev", "mode=1777", "size=1g" ] }
+  ],
+
+  "_comment_registry": "The uxcd side of the container (/etc/uxc/<name>.json). Only keys you do NOT already have are written, so an upgrade or a re-pull never overwrites your edits.",
+  "_registry": {
+    "_comment_env": "EDIT BOTH. TZ is what makes recordings and the timeline carry your local time, and FRIGATE_RTSP_PASSWORD is what config.yml's {FRIGATE_RTSP_PASSWORD} expands to - the image ships a placeholder, so change it. Editable in LuCI: Configure -> Environment.",
+    "env": [
+      "TZ=UTC",
+      "FRIGATE_RTSP_PASSWORD=changeme"
+    ],
+
+    "_comment_shm": "Frigate sizes /dev/shm by camera count and resolution and REFUSES to start when it is too small - it logs the exact figure it wants. 1280m suits a handful of HD cameras; raise it if the log asks you to. This is RAM.",
+    "shm_size": "1280m",
+
+    "_comment_devices": "Missing devices are skipped, so this list is safe on a box with no GPU and no Coral. /dev/dri = VAAPI/QSV, /dev/bus/usb = USB Coral (pass the whole bus: the TPU re-enumerates after its firmware upload), /dev/apex_0 = M.2 or PCIe Coral.",
+    "devices": [ "/dev/dri", "/dev/bus/usb", "/dev/apex_0" ],
+
+    "_comment_volumes": "EDIT THESE. /config holds config.yml + the database, /media the recordings - point that one at your biggest partition.",
+    "volumes": [
+      "/srv/frigate/config:/config",
+      "/srv/frigate/media:/media"
+    ],
+
+    "_comment_health": "Lets uxcd verify an upgrade before keeping it: a bad version is rolled back automatically. Frigate needs a couple of minutes to come up with several cameras, hence the long start_period.",
+    "healthcheck": {
+      "checks": [ { "type": "http", "target": "127.0.0.1:5000/api/version" } ],
+      "interval": 30,
+      "retries": 3,
+      "start_period": 120
+    },
+
+    "_comment_web": "Port 5000 is the web UI (auto-detected from EXPOSE too). 8554/RTSP and 8555/WebRTC are not web UIs and stay out. The scheme is stated explicitly: Frigate serves plain http, and a browser sitting on an https LuCI page will otherwise try to upgrade the link.",
+    "web_ports": [ { "port": 5000, "scheme": "http", "label": "Frigate" } ],
+
+    "respawn": true,
+    "urls": [
+      "https://docs.frigate.video",
+      "https://github.com/blakeblackshear/frigate"
+    ],
+    "notes": "Config lives in /config/config.yml. Frigate logs the /dev/shm size it wants at startup - set it as shm_size. Coral TPUs are passed through as whole device directories, so a re-enumerating USB TPU keeps working."
+  }
 }

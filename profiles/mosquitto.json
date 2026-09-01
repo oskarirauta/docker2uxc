@@ -1,14 +1,35 @@
 {
-  "_comment": "Eclipse Mosquitto (MQTT broker) overlay. Apply with --profile mosquitto. Arrays APPEND to the base config; EDIT the bind 'source' paths (they must exist). See profiles/README.md.",
-  "_comment_net": "Mosquitto listens on 1883 (+ 8883/9001 if configured). uxcd does no port mapping - run it on the host network, or in a shared 'infra' netns with the clients that need it.",
-  "_comment_config": "Provide a mosquitto.conf in the config dir (set 'persistence true' + 'persistence_location /mosquitto/data/' to keep retained messages).",
+  "_description": "Eclipse Mosquitto MQTT broker: config/data binds, a TCP health check on 1883, and the capabilities its entrypoint needs to drop privileges.",
+
+  "_comment": "EDIT the two volume paths below. Put a mosquitto.conf in the config dir before the first start - without one the broker only listens on localhost. Add 'persistence true' + 'persistence_location /mosquitto/data/' to keep retained messages.",
+
+  "_comment_caps": "The entrypoint chowns /mosquitto and then re-executes the broker as the unprivileged 'mosquitto' user, which needs CAP_CHOWN + CAP_SETUID/CAP_SETGID + CAP_DAC_OVERRIDE. Those are in the default (permissive) set; listing them here keeps the profile working with --caps minimal too.",
+  "_caps_add": [ "CAP_CHOWN", "CAP_FOWNER", "CAP_DAC_OVERRIDE", "CAP_SETUID", "CAP_SETGID" ],
+
   "process": {
-    "env": ["TZ=UTC"]
+    "env": [ "TZ=UTC" ]
   },
-  "mounts": [
-    { "destination": "/mosquitto/config", "type": "bind", "source": "/srv/CHANGEME/mosquitto/config",
-      "options": ["rbind", "rw"] },
-    { "destination": "/mosquitto/data", "type": "bind", "source": "/srv/CHANGEME/mosquitto/data",
-      "options": ["rbind", "rw"] }
-  ]
+
+  "_comment_net": "Mosquitto listens on 1883 (+ 8883/9001 when configured). uxcd does no port mapping: run it on the host network (the default) or in a shared 'infra' netns with the clients that need it.",
+
+  "_comment_seed": "Mosquitto 2.x refuses to start without a config file, so a profiled pull would leave you with a crash loop. This writes a starting one - only if it is not already there - and it is deliberately CLOSED: add a password file or allow_anonymous before clients can connect.",
+  "_seed": {
+    "/srv/mosquitto/config/mosquitto.conf": "# Written by the uxcd 'mosquitto' profile. Edit freely - it is never overwritten.\n\nlistener 1883\n\n# Closed by default. Pick ONE:\n#   1) create a password file and point at it:\n#        uxe mqtt mosquitto_passwd -c -b /mosquitto/config/passwd <user> <password>\n#        password_file /mosquitto/config/passwd\n#   2) or, on a trusted LAN only:\n#        allow_anonymous true\nallow_anonymous false\n\npersistence true\npersistence_location /mosquitto/data/\n\nlog_dest stdout\n"
+  },
+  "_registry": {
+    "_comment_volumes": "EDIT THESE.",
+    "volumes": [
+      "/srv/mosquitto/config:/mosquitto/config",
+      "/srv/mosquitto/data:/mosquitto/data"
+    ],
+    "healthcheck": {
+      "checks": [ { "type": "tcp", "target": "127.0.0.1:1883" } ],
+      "interval": 30,
+      "retries": 3,
+      "start_period": 10
+    },
+    "respawn": true,
+    "urls": [ "https://mosquitto.org/man/mosquitto-conf-5.html" ],
+    "notes": "Broker config: /mosquitto/config/mosquitto.conf. Anonymous access is off by default in 2.x - add a listener and either 'allow_anonymous true' or a password file."
+  }
 }

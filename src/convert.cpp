@@ -8,6 +8,7 @@
 #include "archive.hpp"
 #include "extract.hpp"
 #include "bundle.hpp"
+#include "space.hpp"
 #include "reg.hpp"
 #include "dockerfile.hpp"
 #include "emit.hpp"
@@ -124,6 +125,82 @@ bool fetch_blob_cached(const ImageRef& ref, const std::string& digest, const std
 	return true;
 }
 
+// Is this layer blob already in the cache? (Only for budgeting - a hit is
+// re-verified when it is actually used.)
+bool blob_cached(const std::string& cache_dir, const std::string& digest) {
+	if ( cache_dir.empty()) return false;
+	std::string hex = digest;
+	std::string::size_type c = hex.find(':');
+	if ( c != std::string::npos ) hex = hex.substr(c + 1);
+	struct stat st;
+	return ( stat(( cache_dir + "/" + hex ).c_str(), &st) == 0 && st.st_size > 0 );
+}
+
+// Refuse a pull that plainly does not fit, BEFORE a single byte is downloaded.
+// Running a filesystem to zero bytes free is not an ordinary error on a small
+// box: everything that wants to write - logs, ubus, the shell you would fix it
+// from - blocks or dies, and that is what "the whole system froze and then
+// crashed" looks like from the outside. Manifests declare each layer's
+// compressed size, so the budget is a real number, not a guess.
+//
+//   cache  <- the compressed blobs we still have to download
+//   bundle <- the extracted rootfs, roughly 2.5x compressed for gzip/zstd
+//
+// When the two live on the same filesystem they are added together. A cache on
+// tmpfs is RAM: filling it is worse than filling a disk, so it gets the same
+// budget check and a louder message.
+bool preflight_space(const manifest::Image& img, const std::string& rootfs_dir,
+                     const std::string& work_dir, const Options& o, std::string& err) {
+	unsigned long long dl = 0, total = 0, biggest = 0;
+	bool sizes_known = true;
+	for ( const auto& L : img.layers ) {
+		if ( L.size <= 0 ) { sizes_known = false; continue; }
+		total += (unsigned long long)L.size;
+		if ( (unsigned long long)L.size > biggest ) biggest = (unsigned long long)L.size;
+		if ( !blob_cached(o.cache_dir, L.digest)) dl += (unsigned long long)L.size;
+	}
+	if ( !sizes_known || total == 0 ) return true;      // nothing to budget against
+
+	unsigned long long need_rootfs  = total / 2 * 5;         // ~2.5x expansion
+	unsigned long long need_cache   = o.cache_dir.empty() ? 0 : dl;
+	unsigned long long need_scratch = biggest / 2 * 7;       // one layer, compressed + decompressed
+
+	space::Info bundle_fs  = space::of(rootfs_dir);
+	space::Info cache_fs   = o.cache_dir.empty() ? space::Info() : space::of(o.cache_dir);
+	space::Info scratch_fs = space::of(work_dir);
+
+	// fold the budgets of everything that shares a filesystem
+	struct Claim { space::Info fs; unsigned long long need; std::string what; };
+	std::vector<Claim> claims;
+	auto claim = [&](const space::Info& fs, unsigned long long need, const std::string& what) {
+		if ( !fs.ok || need == 0 ) return;
+		for ( Claim& c : claims )
+			if ( space::same(c.fs, fs)) { c.need += need; c.what += " + " + what; return; }
+		claims.push_back({ fs, need, what });
+	};
+	claim(bundle_fs,  need_rootfs,  "unpacked rootfs");
+	claim(cache_fs,   need_cache,   "download cache");
+	claim(scratch_fs, need_scratch, "scratch");
+
+	for ( const Claim& c : claims ) {
+		if ( space::usable(c.fs) >= c.need ) continue;
+		err = "not enough space for the " + c.what + " on " + c.fs.mount + ": need " +
+		      space::human(c.need) + ", " + space::human(space::usable(c.fs)) + " usable (" +
+		      space::human(c.fs.avail) + " free, keeping " + space::human(space::reserve(c.fs)) +
+		      " in reserve so the system stays usable)" +
+		      ( c.fs.tmpfs ? ". That filesystem is RAM, not disk" : "" ) +
+		      ". Free space, or use --out <dir> / --cache <dir> on a filesystem that has room";
+		return false;
+	}
+
+	if ( cache_fs.ok && cache_fs.tmpfs && need_cache > cache_fs.total / 4 )
+		logger::info << "note: the blob cache (" << o.cache_dir << ") is in RAM and this image needs "
+		             << space::human(need_cache) << " of it - use --cache <dir on disk> if memory is tight" << std::endl;
+	logger::info << "size:    " << space::human(total) << " to download, about "
+	             << space::human(need_rootfs) << " unpacked" << std::endl;
+	return true;
+}
+
 // Resolve a manifest, fetch its config blob into cfg_path, and extract every layer
 // into rootfs_dir. Shared by a plain pull and each image-based Dockerfile stage.
 bool pull_into(const ImageRef& ref, const std::string& arch_base, const std::string& arch_var,
@@ -131,6 +208,7 @@ bool pull_into(const ImageRef& ref, const std::string& arch_base, const std::str
                work::Dir& wd, const Options& o, manifest::Image& img, std::string& err) {
 	if ( !manifest::resolve(ref, arch_base, arch_var, o.auth_file, img, err)) return false;
 	logger::verbose << "  " << img.layers.size() << " layer(s), config " << img.config_digest << std::endl;
+	if ( !preflight_space(img, rootfs_dir, wd.path(), o, err)) return false;
 	if ( !fetch_blob_cached(ref, img.config_digest, o.auth_file, cfg_path, o.verify, o.cache_dir, err)) { err = "config: " + err; return false; }
 	int li = 0;
 	for ( const auto& L : img.layers ) {
@@ -138,8 +216,17 @@ bool pull_into(const ImageRef& ref, const std::string& arch_base, const std::str
 		if ( work::cancelled ) { err = "cancelled"; return false; }
 		std::string lf = wd.path() + "/layer" + std::to_string(li);
 		logger::verbose << "  layer " << li << "/" << img.layers.size() << std::endl;
-		if ( !fetch_blob_cached(ref, L.digest, o.auth_file, lf, o.verify, o.cache_dir, err)) { err = "layer " + std::to_string(li) + ": " + err; return false; }
-		if ( !extract::layer(lf, rootfs_dir, wd.path() + "/layer.tar", err)) { err = "extract layer " + std::to_string(li) + ": " + err; return false; }
+		// watch the filesystem we are writing to and stop while there is still
+		// room to recover in - a download lands in the cache, the extraction in
+		// the bundle, and those can be different filesystems
+		space::arm(o.cache_dir.empty() ? wd.path() : o.cache_dir);
+		bool got = fetch_blob_cached(ref, L.digest, o.auth_file, lf, o.verify, o.cache_dir, err);
+		space::disarm();
+		if ( !got ) { err = "layer " + std::to_string(li) + ": " + err; return false; }
+		space::arm(rootfs_dir);
+		bool unpacked = extract::layer(lf, rootfs_dir, wd.path() + "/layer.tar", err);
+		space::disarm();
+		if ( !unpacked ) { err = "extract layer " + std::to_string(li) + ": " + err; return false; }
 		unlink(lf.c_str());
 	}
 	return true;
@@ -358,7 +445,43 @@ bool convert(Options& o, std::string& err) {
 	rm_rf(out);                          // stale leftovers from an earlier
 	rm_rf(out_final + ".prev.old");      // cancelled/failed/killed run
 
-	work::Dir wd;
+	// Say where this is going BEFORE downloading a gigabyte to the wrong place:
+	// with no --out a bundle lands in ./<name>, i.e. the current directory.
+	{
+		std::string parent = out_final.substr(0, out_final.find_last_of('/') == std::string::npos ? 0 : out_final.find_last_of('/'));
+		char* prp = realpath(parent.empty() ? "." : parent.c_str(), nullptr);
+		std::string pabs = prp ? std::string(prp) : parent;
+		free(prp);
+		std::string base = out_final.substr(out_final.find_last_of('/') == std::string::npos ? 0 : out_final.find_last_of('/') + 1);
+		logger::info << "output:  " << ( pabs.empty() ? "" : pabs + "/" ) << base
+		             << ( o.out.empty() ? "   (default location - set it with --out)" : "" ) << std::endl;
+	}
+
+	// A cancelled or failed run must not leave a half-extracted rootfs sitting on
+	// the disk it just filled: that is the difference between "the pull failed"
+	// and "the pull failed AND the partition is still full".
+	struct OutCleanup {
+		std::string path;
+		bool armed = true;
+		~OutCleanup() { if ( armed ) rm_rf(path); }
+	} out_cleanup{ out };
+
+	// Scratch holds one fully decompressed layer at a time. /tmp is RAM on
+	// OpenWrt, so prefer the bundle's own storage when it is real disk - an
+	// image that fits on /srv should never be able to exhaust memory.
+	std::string work_base;
+	{
+		const char* e = getenv("DOCKER2UXC_WORK");
+		if ( e && *e ) work_base = e;
+		else {
+			std::string parent = out_final.substr(0, out_final.find_last_of('/'));
+			if ( out_final.find_last_of('/') == std::string::npos ) parent = ".";
+			space::Info ofs = space::of(parent), tfs = space::of("/tmp");
+			if ( ofs.ok && !ofs.tmpfs && ( !tfs.ok || tfs.tmpfs || space::usable(ofs) > space::usable(tfs)))
+				work_base = parent;
+		}
+	}
+	work::Dir wd(work_base);
 	if ( !wd.ok()) { err = "cannot create work directory"; return false; }
 	mkdir(out.c_str(), 0755);
 	std::string rootfs = out + "/rootfs";
@@ -454,9 +577,10 @@ bool convert(Options& o, std::string& err) {
 	}
 	if ( !bundle::write_config(cfgblob, rootfs, bo, out + "/config.json", err)) { err = "config.json: " + err; return false; }
 
+	emit::ProfileInfo pinfo;
 	if ( !o.profile.empty()) {
 		logger::info << "==> applying profile: " << o.profile << std::endl;
-		if ( !emit::profile(out + "/config.json", emit::profile_dir(), o.profile, err)) return false;
+		if ( !emit::profile(out + "/config.json", emit::profile_dir(), o.profile, &pinfo, err)) return false;
 	}
 
 	copy_file(cfgblob, out + "/image-config.json");
@@ -473,6 +597,7 @@ bool convert(Options& o, std::string& err) {
 		if ( rename(out_final.c_str(), ( out_final + ".prev" ).c_str()) != 0 ) { err = "cannot rotate " + out_final + " to .prev"; return false; }
 	}
 	if ( rename(out.c_str(), out_final.c_str()) != 0 ) { err = "cannot move " + out + " into place"; return false; }
+	out_cleanup.armed = false;           // the bundle is live now, not scratch
 	out = out_final;
 	rm_rf(out_final + ".prev.old");
 
@@ -501,7 +626,7 @@ bool convert(Options& o, std::string& err) {
 		if ( !emit::notes(ni, nerr)) logger::error << "notes: " << nerr << std::endl;   // non-fatal
 	}
 	emit::warn_missing_binds(out + "/config.json");
-	logger::info << "==> bundle ready: " << out << std::endl;
+	logger::info << "==> bundle ready: " << abs_out << std::endl;
 
 	if ( o.do_register ) {
 		// a Dockerfile FROM is the base image, not "the image" - no update provenance
@@ -515,6 +640,33 @@ bool convert(Options& o, std::string& err) {
 			if ( !overlay.empty()) mkdir(overlay.c_str(), 0700);   // ujail -O needs the dir to exist
 		if ( !reg::register_container(o.uxc_dir, name, abs_out, prov_image, prov_digest, o.infra, o.autostart, web_ports, stop_sig, overlay, err)) { err = "register: " + err; return false; }
 		logger::info << "==> registered: " << o.uxc_dir << "/" << name << ".json" << std::endl;
+		// a profile's "_registry" half: devices, shm_size, volumes, healthcheck,
+		// notes... the things that cannot live in an OCI config but are exactly
+		// what makes an application container actually run
+		if ( pinfo.registry.type() == JSON::TYPE::OBJECT && pinfo.registry.begin() != pinfo.registry.end()) {
+			std::vector<std::string> applied;
+			std::string rerr;
+			if ( !reg::apply_profile_registry(o.uxc_dir, name, pinfo.registry, applied, rerr))
+				logger::error << "profile registry: " << rerr << std::endl;      // non-fatal: the bundle is fine
+			else if ( !applied.empty()) {
+				std::string s;
+				for ( const std::string& k : applied ) s += ( s.empty() ? "" : ", " ) + k;
+				logger::info << "    profile set: " << s << std::endl;
+			}
+		}
+		// starting config files the application cannot come up without
+		{
+			std::vector<std::string> seeded = emit::seed_files(pinfo.seed);
+			for ( const std::string& s : seeded )
+				logger::info << "    wrote a starting config: " << s << " (edit it before going live)" << std::endl;
+		}
+		if ( !pinfo.needs.empty()) {
+			logger::info << "    the profile needs these host paths to exist before a start:" << std::endl;
+			for ( const std::string& p : pinfo.needs ) {
+				struct stat nst;
+				logger::info << "      " << p << ( stat(p.c_str(), &nst) == 0 ? "" : "   <-- MISSING" ) << std::endl;
+			}
+		}
 		if ( web_ports.begin() != web_ports.end())
 			logger::info << "    web UI port(s) detected from EXPOSE - review/label them in LuCI" << std::endl;
 	}

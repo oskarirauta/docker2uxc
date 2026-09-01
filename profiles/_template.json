@@ -1,25 +1,39 @@
 {
-  "_comment": "Boilerplate profile. Copy to <name>.json and apply with --profile <name>. Keys starting with _ are stripped. Overlay rules: object keys merge recursively, arrays are APPENDED to the base config (so listed mounts/caps add to, never replace, the defaults). See profiles/README.md.",
+  "_description": "One line describing what this profile is for - shown by `uxc profiles` and in the LuCI dropdown.",
 
-  "_comment_caps": "Extra capabilities to ADD on top of the --caps set (e.g. privileged-ish containers). Remove this block if not needed.",
-  "process": {
-    "capabilities": {
-      "bounding":    ["CAP_SYS_ADMIN"],
-      "effective":   ["CAP_SYS_ADMIN"],
-      "permitted":   ["CAP_SYS_ADMIN"],
-      "inheritable": ["CAP_SYS_ADMIN"]
-    }
-  },
+  "_comment": "Boilerplate profile. Copy to <name>.json and apply with --profile <name>. Every key starting with '_' is a directive or a comment and never reaches config.json. Merge rules: objects merge recursively, mounts merge BY DESTINATION, other arrays append, scalars replace. See profiles/README.md.",
 
-  "_comment_mounts": "Bind your host paths and devices here. 'source' is on the HOST, 'destination' inside the container. Use rbind for binds; tmpfs for scratch/shm. EDIT every source path.",
+  "_comment_caps": "Capabilities ADDED on top of the --caps set. This is what you almost always want. (Writing process.capabilities instead REPLACES the whole set - that scopes a container down, but forget CAP_CHOWN and its init dies on the first chown.)",
+  "_caps_add": [ "CAP_SYS_ADMIN" ],
+
+  "_comment_mounts": "Bundle-side mounts. Prefer _registry.volumes below for data binds - those are visible and editable in LuCI. Use this section for things only the OCI config can express, such as a sized tmpfs. A mount marked _optional is skipped when its host source does not exist, instead of failing the container.",
   "mounts": [
-    { "destination": "/config", "type": "bind", "source": "/srv/CHANGEME/config",
-      "options": ["rbind", "rw"] },
-    { "destination": "/data", "type": "bind", "source": "/srv/CHANGEME/data",
-      "options": ["rbind", "rw"] },
-    { "destination": "/dev/shm", "type": "tmpfs", "source": "tmpfs",
-      "options": ["nosuid", "nodev", "mode=1777", "size=128m"] },
+    { "destination": "/tmp", "type": "tmpfs", "source": "tmpfs",
+      "options": [ "nosuid", "nodev", "mode=1777", "size=256m" ] },
     { "destination": "/dev/dri", "type": "bind", "source": "/dev/dri",
-      "options": ["rbind"] }
-  ]
+      "options": [ "rbind" ], "_optional": true }
+  ],
+
+  "_comment_registry": "The uxcd side of the container (/etc/uxc/<name>.json): everything an OCI config cannot say. Only keys the entry does not already have are written, so re-pulls and upgrades never overwrite the user's edits.",
+  "_registry": {
+    "_comment_volumes": "host:container[:ro] - EDIT these.",
+    "volumes": [
+      "/srv/CHANGEME/config:/config",
+      "/srv/CHANGEME/data:/data"
+    ],
+    "_comment_devices": "Device nodes AND directories. A directory (/dev/dri, /dev/bus/usb) is bind-mounted live and allowed by major number, so hotplug and re-enumeration keep working. Devices that do not exist on this host are skipped.",
+    "devices": [ "/dev/dri" ],
+    "_comment_shm": "Sized /dev/shm when the app needs more than the default. This is RAM.",
+    "shm_size": "128m",
+    "healthcheck": {
+      "checks": [ { "type": "tcp", "target": "127.0.0.1:8080" } ],
+      "interval": 30,
+      "retries": 3,
+      "start_period": 20
+    },
+    "web_ports": [ { "port": 8080 } ],
+    "respawn": true,
+    "urls": [ "https://example.org/docs" ],
+    "notes": "Anything the next person needs to know before touching this container."
+  }
 }

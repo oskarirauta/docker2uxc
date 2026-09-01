@@ -2,12 +2,14 @@
 #include <string>
 #include <vector>
 #include <cstdlib>
+#include <sys/stat.h>
 
 #include "usage.hpp"
 #include "logger.hpp"
 #include "http.hpp"
 #include "work.hpp"
 #include "convert.hpp"
+#include "emit.hpp"
 
 // Thin CLI over the docker2uxc converter library: parse args into Options and
 // hand off to docker2uxc::convert / resolve_digest / check_updates.
@@ -25,7 +27,7 @@ int main(int argc, char** argv) {
 			.description = "\nOCI image -> ujail/uxc bundle converter (C++)",
 		},
 		.options = {
-			{ "out",            { .key = "o", .word = "out",            .desc = "output bundle directory",                  .flag = usage_t::REQUIRED, .name = "dir" }},
+			{ "out",            { .key = "o", .word = "out",            .desc = "output bundle dir (default ./<name>: HERE)", .flag = usage_t::REQUIRED, .name = "dir" }},
 			{ "name",           { .key = "n", .word = "name",           .desc = "container name",                            .flag = usage_t::REQUIRED, .name = "name" }},
 			{ "arch",           { .key = "a", .word = "arch",           .desc = "target architecture (default: host)",      .flag = usage_t::REQUIRED, .name = "arch" }},
 			{ "dockerfile",     { .key = "d", .word = "dockerfile",     .desc = "build from a Dockerfile (FROM = base image)", .flag = usage_t::REQUIRED, .name = "file" }},
@@ -34,6 +36,7 @@ int main(int argc, char** argv) {
 			{ "infra",          {             .word = "infra",          .desc = "register as a member of shared netns NAME", .flag = usage_t::REQUIRED, .name = "netns" }},
 			{ "caps",           {             .word = "caps",           .desc = "capability set: permissive | minimal",      .flag = usage_t::REQUIRED, .name = "set" }},
 			{ "profile",        {             .word = "profile",        .desc = "apply profiles/<NAME>.json overlay",        .flag = usage_t::REQUIRED, .name = "name" }},
+			{ "profiles",       {             .word = "profiles",       .desc = "list the available profiles, then exit" }},
 			{ "network",        {             .word = "network",        .desc = "host | isolated (default host)",            .flag = usage_t::REQUIRED, .name = "mode" }},
 			{ "emit-netconfig", {             .word = "emit-netconfig", .desc = "write an /etc/config/network veth/infra snippet" }},
 			{ "net-bridge",     {             .word = "net-bridge",     .desc = "bridge for --emit-netconfig (default br-lan)", .flag = usage_t::REQUIRED, .name = "br" }},
@@ -66,6 +69,35 @@ int main(int argc, char** argv) {
 	work::install_signal_handlers();
 
 	auto fin = [&](int rc) { http::global_cleanup(); return rc; };
+
+	// --profiles: what overlays this install has, and what each one does.
+	if ( (bool)usage["profiles"] ) {
+		std::string dir = emit::profile_dir();
+		std::vector<std::string> names = emit::profile_names(dir);
+		if ( names.empty()) std::cout << "no profiles in " << dir << std::endl;
+		else std::cout << "profiles in " << dir << ":" << std::endl;
+		for ( const std::string& n : names ) {
+			emit::ProfileInfo pi;
+			std::string perr;
+			if ( !emit::profile_info(dir, n, pi, perr)) { std::cout << "  " << n << "\t(" << perr << ")" << std::endl; continue; }
+			std::cout << "  " << n << ( pi.description.empty() ? "" : "  -  " + pi.description ) << std::endl;
+			if ( !pi.caps_add.empty()) {
+				std::cout << "      adds capabilities:";
+				for ( const std::string& c : pi.caps_add ) std::cout << " " << c;
+				std::cout << std::endl;
+			}
+			if ( !pi.devices.empty()) {
+				std::cout << "      devices:";
+				for ( const std::string& d : pi.devices ) std::cout << " " << d;
+				std::cout << std::endl;
+			}
+			for ( const std::string& p : pi.needs ) {
+				struct stat nst;
+				std::cout << "      needs host path: " << p << ( stat(p.c_str(), &nst) == 0 ? "" : "   (missing)" ) << std::endl;
+			}
+		}
+		return fin(0);
+	}
 
 	// --check-updates: no positional ref; loop the registry and print the report.
 	if ( (bool)usage["check-updates"] ) {

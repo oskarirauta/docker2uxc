@@ -12,11 +12,51 @@ namespace emit {
 // (dev tree), else /usr/share/docker2uxc/profiles.
 std::string profile_dir();
 
+// Everything a profile says that is NOT part of the OCI config.json: the human
+// description, the uxcd registry fields it seeds, and the host paths its binds
+// and volumes need to exist. Filled by profile() and profile_info().
+struct ProfileInfo {
+	std::string name;
+	std::string description;              // "_description"
+	JSON registry = JSON::Object();       // "_registry": seeded into <uxc_dir>/<name>.json
+	JSON seed = JSON::Object();           // "_seed": { host path: contents } written only when absent
+	std::vector<std::string> needs;       // host paths that must exist before a start
+	std::vector<std::string> devices;     // devices the profile passes through
+	std::vector<std::string> caps_add;    // capabilities added on top of --caps
+};
+
+// Read <dir>/<name>.json WITHOUT applying it - for `uxc profiles` and the LuCI
+// dropdown, so a user can see what a profile does before choosing it.
+bool profile_info(const std::string& dir, const std::string& name, ProfileInfo& out, std::string& err);
+
+// Profile names in `dir`, sorted, "_"-prefixed templates skipped.
+std::vector<std::string> profile_names(const std::string& dir);
+
 // Deep-merge <profile_dir>/<name>.json onto the bundle config.json (config_path)
-// in place: objects merged key-by-key (overlay wins, recursing), arrays
-// concatenated, scalars replaced; keys starting with '_' are stripped (profile
-// comments). Returns false + err (profile missing, parse/merge/write error).
-bool profile(const std::string& config_path, const std::string& dir, const std::string& name, std::string& err);
+// in place. Merge rules:
+//   - objects      merged key by key, recursing
+//   - mounts[]     merged BY DESTINATION (the profile's entry replaces the base
+//                  mount at the same path; two mounts on one destination make
+//                  ujail reject the whole spec)
+//   - other arrays concatenated
+//   - capability sets REPLACED (a profile can scope caps down); "_caps_add"
+//                  instead ADDS to whatever --caps produced - almost always
+//                  what an application profile wants
+//   - a mount marked "_optional": true is dropped when its host source is
+//                  absent, so a profile can offer /dev/dri or /dev/bus/usb
+//                  without breaking boxes that have neither
+// Keys starting with '_' are stripped from the result (they are the profile's
+// own directives and comments). Returns false + err (profile missing, parse,
+// merge or write error). `info`, when given, receives the non-OCI half.
+bool profile(const std::string& config_path, const std::string& dir, const std::string& name,
+             ProfileInfo* info, std::string& err);
+
+// Write a profile's "_seed" files ({ host path: contents }). A file that already
+// exists is never touched, parent directories are created. This is what lets a
+// profiled pull produce a container that actually starts: an application whose
+// config file must exist before its first run (mosquitto.conf, ...) gets a
+// commented starting point instead of a crash loop. Returns the paths written.
+std::vector<std::string> seed_files(const JSON& seed);
 
 // Write <out>/network.uci - an /etc/config/network veth/bridge/infra snippet for
 // an isolated container. Never applied automatically.

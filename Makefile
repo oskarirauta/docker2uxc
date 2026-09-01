@@ -1,7 +1,11 @@
 all: docker2uxc
 
+-include $(wildcard objs/*.d)
+
 CXX?=g++
 CXXFLAGS?=--std=c++17 -Wall -fPIC
+# -MMD -MP: emit a .d per object so a changed HEADER rebuilds what includes it
+CXXFLAGS += -MMD -MP
 LDFLAGS?=-L/lib -L/usr/lib
 
 OBJS:= \
@@ -17,6 +21,7 @@ OBJS:= \
 	objs/reg.o \
 	objs/dockerfile.o \
 	objs/emit.o \
+	objs/space.o \
 	objs/convert.o \
 	objs/main.o
 
@@ -75,6 +80,9 @@ objs/dockerfile.o: src/dockerfile.cpp
 	$(CXX) $(CXXFLAGS) $(INCLUDES) -c -o $@ $<;
 
 objs/emit.o: src/emit.cpp
+	$(CXX) $(CXXFLAGS) $(INCLUDES) -c -o $@ $<;
+
+objs/space.o: src/space.cpp
 	$(CXX) $(CXXFLAGS) $(INCLUDES) -c -o $@ $<;
 
 objs/convert.o: src/convert.cpp

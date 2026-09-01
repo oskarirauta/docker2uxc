@@ -1,9 +1,12 @@
 #include "http.hpp"
 #include <cstdio>
 #include <cctype>
+#include <cerrno>
+#include <cstring>
 #include <algorithm>
 #include <curl/curl.h>
 #include "work.hpp"
+#include "space.hpp"
 
 namespace http {
 
@@ -32,9 +35,20 @@ static size_t header_cb(char* ptr, size_t sz, size_t n, void* ud) {
 	return sz * n;
 }
 
-// abort the transfer promptly when a cancel (SIGTERM) arrives
-static int xfer_cb(void*, curl_off_t, curl_off_t, curl_off_t, curl_off_t) {
-	return work::cancelled ? 1 : 0;
+// Abort the transfer promptly on a cancel (SIGTERM) - or when the filesystem we
+// are downloading into is about to fill up. curl calls this several times a
+// second; space::low() does its own once-a-second throttling of the statvfs.
+static int xfer_cb(void* ud, curl_off_t, curl_off_t dlnow, curl_off_t, curl_off_t) {
+	if ( work::cancelled ) return 1;
+	// feed the watchdog the bytes since the last callback (dlnow is cumulative
+	// per transfer, and resets when the next blob starts)
+	curl_off_t* prev = static_cast<curl_off_t*>(ud);
+	unsigned long long delta = 0;
+	if ( prev ) {
+		if ( dlnow >= *prev ) delta = (unsigned long long)( dlnow - *prev );
+		*prev = dlnow;
+	}
+	return space::low(delta) ? 1 : 0;
 }
 
 static curl_slist* build_headers(const std::vector<std::string>& hs) {
@@ -99,12 +113,14 @@ bool get_to_file(const std::string& url, const std::vector<std::string>& extra, 
 	CURL* c = curl_easy_init();
 	if ( !c ) { std::fclose(f); err = "curl_easy_init failed"; return false; }
 	curl_slist* sl = build_headers(extra);
+	curl_off_t progress = 0;              // last dlnow, so xfer_cb can report a delta
 
 	curl_easy_setopt(c, CURLOPT_URL, url.c_str());
 	curl_easy_setopt(c, CURLOPT_FOLLOWLOCATION, 1L);
 	curl_easy_setopt(c, CURLOPT_REDIR_PROTOCOLS_STR, "https");   // registries redirect blobs; never follow one to http:// (SSRF/downgrade)
 	curl_easy_setopt(c, CURLOPT_NOPROGRESS, 0L);
 	curl_easy_setopt(c, CURLOPT_XFERINFOFUNCTION, xfer_cb);
+	curl_easy_setopt(c, CURLOPT_XFERINFODATA, &progress);
 	curl_easy_setopt(c, CURLOPT_MAXREDIRS, 8L);
 	curl_easy_setopt(c, CURLOPT_SSL_VERIFYPEER, 1L);         // explicit (libcurl default, but security-critical)
 	curl_easy_setopt(c, CURLOPT_SSL_VERIFYHOST, 2L);
@@ -115,7 +131,13 @@ bool get_to_file(const std::string& url, const std::vector<std::string>& extra, 
 	if ( sl ) curl_easy_setopt(c, CURLOPT_HTTPHEADER, sl);
 
 	CURLcode rc = curl_easy_perform(c);
-	if ( rc != CURLE_OK ) err = work::cancelled ? "cancelled" : curl_easy_strerror(rc);
+	if ( rc != CURLE_OK ) {
+		if      ( work::cancelled ) err = "cancelled";
+		else if ( space::low())     err = space::why();          // our watchdog aborted it
+		else if ( rc == CURLE_WRITE_ERROR )                      // fwrite() fell short: usually ENOSPC
+			err = "cannot write " + path + ": " + std::strerror(errno);
+		else err = curl_easy_strerror(rc);
+	}
 
 	if ( sl ) curl_slist_free_all(sl);
 	curl_easy_cleanup(c);

@@ -55,4 +55,43 @@ bool register_container(const std::string& uxc_dir, const std::string& name, con
 	return true;
 }
 
+bool apply_profile_registry(const std::string& uxc_dir, const std::string& name, const JSON& block,
+                            std::vector<std::string>& applied, std::string& err) {
+	if ( block.type() != JSON::TYPE::OBJECT ) return true;
+	std::string path = uxc_dir + "/" + name + ".json";
+
+	JSON entry = JSON::Object();
+	{
+		std::ifstream f(path);
+		if ( !f ) { err = "no registry entry at " + path; return false; }
+		std::string s((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+		try { JSON e = JSON::parse(s); if ( e.type() == JSON::TYPE::OBJECT ) entry = e; }
+		catch ( ... ) { err = "cannot parse " + path; return false; }
+	}
+
+	bool changed = false;
+	for ( auto it = block.begin(); it != block.end(); ++it ) {
+		std::string k = it.key();
+		if ( k.empty() || k[0] == '_' ) continue;
+		// never let a shared profile file redefine identity/provenance
+		if ( k == "name" || k == "path" || k == "image" || k == "digest" || k == "created" ) continue;
+		if ( entry.contains(k)) continue;              // the user's own value always wins
+		entry[k] = it.value();
+		applied.push_back(k);
+		changed = true;
+	}
+	if ( !changed ) return true;
+
+	std::string tmp = path + ".tmp";
+	{
+		std::ofstream of(tmp);
+		if ( !of ) { err = "cannot write " + tmp; return false; }
+		of << entry.dump(true) << "\n";
+		if ( !of ) { err = "write error on " + tmp; return false; }
+	}
+	chmod(tmp.c_str(), 0600);
+	if ( rename(tmp.c_str(), path.c_str()) != 0 ) { err = "cannot replace " + path; std::remove(tmp.c_str()); return false; }
+	return true;
+}
+
 }

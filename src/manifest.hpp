@@ -8,6 +8,7 @@ namespace manifest {
 struct Layer {
 	std::string digest;       // sha256:...
 	std::string media_type;   // tar+gzip / tar+zstd / tar / ...
+	long long   size = 0;     // COMPRESSED bytes as declared by the manifest (0 = not stated)
 };
 
 struct Image {

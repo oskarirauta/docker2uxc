@@ -6,6 +6,8 @@
 #include <iterator>
 #include <string>
 #include <vector>
+#include <algorithm>
+#include <dirent.h>
 #include <unistd.h>
 #include <sys/stat.h>
 #include <cstdlib>
@@ -36,6 +38,35 @@ std::string sh_quote(const std::string& s) {
 	return r;
 }
 
+std::string mount_dest(const JSON& m) {
+	return ( m.type() == JSON::TYPE::OBJECT && m.contains("destination")) ? m["destination"].to_string() : "";
+}
+
+// Merge two mount arrays BY DESTINATION: an overlay mount replaces the base
+// mount at the same path (keeping the base's position), anything new is
+// appended. Plain concatenation leaves two mounts on one destination, and ujail
+// then rejects the ENTIRE spec ("parsing of OCI JSON spec has failed") - the
+// classic failure of a profile that re-binds /config or /dev/shm.
+JSON merge_mounts(const JSON& base, const JSON& ovl) {
+	JSON r = JSON::Array();
+	for ( auto bi = base.begin(); bi != base.end(); ++bi ) {
+		JSON e = bi.value();
+		std::string d = mount_dest(e);
+		for ( auto oi = ovl.begin(); oi != ovl.end(); ++oi )
+			if ( !d.empty() && mount_dest(oi.value()) == d ) { e = oi.value(); break; }
+		r.append(e);
+	}
+	for ( auto oi = ovl.begin(); oi != ovl.end(); ++oi ) {
+		JSON e = oi.value();
+		std::string d = mount_dest(e);
+		bool seen = false;
+		for ( auto bi = base.begin(); bi != base.end(); ++bi )
+			if ( !d.empty() && mount_dest(bi.value()) == d ) { seen = true; break; }
+		if ( !seen ) r.append(e);
+	}
+	return r;
+}
+
 // recursive deep-merge matching the shell's jq deepmerge($a;$b)
 JSON deepmerge(const JSON& a, const JSON& b) {
 	if ( a.type() == JSON::TYPE::OBJECT && b.type() == JSON::TYPE::OBJECT ) {
@@ -44,10 +75,14 @@ JSON deepmerge(const JSON& a, const JSON& b) {
 			std::string k = it.key();
 			JSON bv = it.value();
 			// OCI capability sets REPLACE, not concatenate, so a profile can scope
-			// caps DOWN (e.g. frigate -> just CAP_SYS_ADMIN), not only ever widen them.
+			// caps DOWN. To ADD to the --caps set - what an application profile
+			// almost always wants - use "_caps_add" instead (apply_caps_add()).
 			bool cap_set = ( k == "bounding" || k == "effective" || k == "permitted" ||
 			                 k == "inheritable" || k == "ambient" );
-			if ( !r.contains(k) || r[k].type() == JSON::TYPE::NULLPTR || cap_set ) r[k] = bv;
+			if ( k == "mounts" && r.contains(k) &&
+			     r[k].type() == JSON::TYPE::ARRAY && bv.type() == JSON::TYPE::ARRAY )
+				r[k] = merge_mounts(r[k], bv);
+			else if ( !r.contains(k) || r[k].type() == JSON::TYPE::NULLPTR || cap_set ) r[k] = bv;
 			else r[k] = deepmerge(r[k], bv);
 		}
 		return r;
@@ -77,6 +112,94 @@ JSON strip_underscore(const JSON& v) {
 		return r;
 	}
 	return v;
+}
+
+// "_caps_add": [...] - union the listed capabilities into every set the base
+// config grants (ambient is left alone: it is empty by design). A profile author
+// means "frigate ALSO needs CAP_SYS_ADMIN and CAP_PERFMON", not "frigate runs
+// with ONLY those two" - the latter silently drops CAP_CHOWN and the container
+// dies on the first chown its init does.
+void apply_caps_add(JSON& cfg, const std::vector<std::string>& add) {
+	if ( add.empty()) return;
+	if ( !cfg.contains("process") || cfg["process"].type() != JSON::TYPE::OBJECT ) return;
+	if ( !cfg["process"].contains("capabilities")) return;
+	for ( const char* set : { "bounding", "effective", "permitted", "inheritable" } ) {
+		JSON cur = cfg["process"]["capabilities"].contains(set) ? cfg["process"]["capabilities"][set] : JSON::Array();
+		if ( cur.type() != JSON::TYPE::ARRAY ) cur = JSON::Array();
+		std::set<std::string> have;
+		for ( auto it = cur.begin(); it != cur.end(); ++it ) have.insert(it.value() -> to_string());
+		for ( const std::string& c : add )
+			if ( have.insert(c).second ) cur.append(JSON(c));
+		cfg["process"]["capabilities"][set] = cur;
+	}
+}
+
+// Drop mounts the profile marked "_optional" whose host source is absent, so a
+// single profile can offer /dev/dri AND /dev/bus/usb and still start on a box
+// that has neither (ujail fails the whole container on one missing bind source).
+void drop_absent_optional(JSON& cfg) {
+	if ( !cfg.contains("mounts") || cfg["mounts"].type() != JSON::TYPE::ARRAY ) return;
+	JSON kept = JSON::Array();
+	for ( auto it = cfg["mounts"].begin(); it != cfg["mounts"].end(); ++it ) {
+		JSON m = *it.value();
+		bool opt = ( m.type() == JSON::TYPE::OBJECT && m.contains("_optional") && m["_optional"].to_bool());
+		std::string src = ( m.type() == JSON::TYPE::OBJECT && m.contains("source")) ? m["source"].to_string() : "";
+		struct stat ost;
+		if ( opt && !src.empty() && src[0] == '/' && stat(src.c_str(), &ost) != 0 ) {
+			logger::info << "    optional mount skipped: " << mount_dest(m)
+			             << " (no " << src << " on this host)" << std::endl;
+			continue;
+		}
+		kept.append(m);
+	}
+	cfg["mounts"] = kept;
+}
+
+// Pull the non-OCI half out of a parsed profile: description, the _registry
+// block, _caps_add, and the host paths its binds/volumes will need.
+void collect_info(const JSON& p, const std::string& name, ProfileInfo& info) {
+	info.name = name;
+	if ( p.contains("_description")) info.description = p["_description"].to_string();
+	if ( p.contains("_registry") && p["_registry"].type() == JSON::TYPE::OBJECT )
+		info.registry = strip_underscore(p["_registry"]);
+	if ( p.contains("_seed") && p["_seed"].type() == JSON::TYPE::OBJECT )
+		info.seed = p["_seed"];
+	// NOTE: JSON's const operator[] returns BY VALUE, so every loop below binds
+	// the array to a local first - begin() and end() taken from two separate
+	// temporaries do not compare.
+	if ( p.contains("_caps_add") && p["_caps_add"].type() == JSON::TYPE::ARRAY ) {
+		const JSON ca = p["_caps_add"];
+		for ( auto it = ca.begin(); it != ca.end(); ++it )
+			info.caps_add.push_back(it.value().to_string());
+	}
+	auto need = [&](const std::string& path) {
+		if ( path.empty() || path[0] != '/' ) return;
+		for ( const std::string& e : info.needs ) if ( e == path ) return;
+		info.needs.push_back(path);
+	};
+	if ( p.contains("mounts") && p["mounts"].type() == JSON::TYPE::ARRAY ) {
+		const JSON ms = p["mounts"];
+		for ( auto it = ms.begin(); it != ms.end(); ++it ) {
+			JSON m = it.value();
+			if ( m.type() != JSON::TYPE::OBJECT ) continue;
+			if ( m.contains("type") && m["type"].to_string() != "bind" ) continue;
+			if ( m.contains("_optional") && m["_optional"].to_bool()) continue;
+			if ( m.contains("source")) need(m["source"].to_string());
+		}
+	}
+	if ( info.registry.contains("volumes") && info.registry["volumes"].type() == JSON::TYPE::ARRAY ) {
+		const JSON vs = info.registry["volumes"];
+		for ( auto it = vs.begin(); it != vs.end(); ++it ) {
+			std::string v = it.value().to_string();
+			std::string::size_type c = v.find(':');
+			need( c == std::string::npos ? v : v.substr(0, c));
+		}
+	}
+	if ( info.registry.contains("devices") && info.registry["devices"].type() == JSON::TYPE::ARRAY ) {
+		const JSON ds = info.registry["devices"];
+		for ( auto it = ds.begin(); it != ds.end(); ++it )
+			info.devices.push_back(it.value().to_string());
+	}
 }
 
 // list the keys of an object field (e.g. .config.ExposedPorts), one "    KEY\n" each
@@ -159,10 +282,71 @@ std::string profile_dir() {
 	return "/usr/share/docker2uxc/profiles";
 }
 
-bool profile(const std::string& config_path, const std::string& dir, const std::string& name, std::string& err) {
+std::vector<std::string> seed_files(const JSON& seed) {
+	std::vector<std::string> written;
+	if ( seed.type() != JSON::TYPE::OBJECT ) return written;
+	for ( auto it = seed.begin(); it != seed.end(); ++it ) {
+		std::string path = it.key();
+		if ( path.empty() || path[0] != '/' ) continue;      // absolute host paths only
+		struct stat st;
+		if ( stat(path.c_str(), &st) == 0 ) continue;        // never overwrite the user's file
+		std::string parent = path.substr(0, path.find_last_of('/'));
+		for ( std::string::size_type i = 1; i <= parent.size(); ++i )   // mkdir -p
+			if ( i == parent.size() || parent[i] == '/' ) mkdir(parent.substr(0, i).c_str(), 0755);
+		std::string werr;
+		if ( write_file(path, it.value().to_string(), werr)) written.push_back(path);
+		else logger::error << "seed: " << werr << std::endl;
+	}
+	return written;
+}
+
+std::vector<std::string> profile_names(const std::string& dir) {
+	std::vector<std::string> names;
+	DIR* d = opendir(dir.c_str());
+	if ( !d ) return names;
+	for ( struct dirent* e; ( e = readdir(d)) != nullptr; ) {
+		std::string fn = e -> d_name;
+		if ( fn.size() <= 5 || fn.substr(fn.size() - 5) != ".json" ) continue;
+		std::string n = fn.substr(0, fn.size() - 5);
+		if ( n.empty() || n[0] == '_' ) continue;     // _template and friends
+		names.push_back(n);
+	}
+	closedir(d);
+	std::sort(names.begin(), names.end());
+	return names;
+}
+
+// A "profile not found" is nearly always a typo - say what IS available.
+static std::string not_found(const std::string& dir, const std::string& name) {
+	std::string m = "profile not found: " + dir + "/" + name + ".json";
+	std::vector<std::string> have = profile_names(dir);
+	if ( !have.empty()) {
+		m += " (available:";
+		for ( const std::string& n : have ) m += " " + n;
+		m += ")";
+	}
+	return m;
+}
+
+bool profile_info(const std::string& dir, const std::string& name, ProfileInfo& out, std::string& err) {
 	std::string pf = dir + "/" + name + ".json";
 	struct stat st;
-	if ( stat(pf.c_str(), &st) != 0 ) { err = "profile not found: " + pf; return false; }
+	if ( stat(pf.c_str(), &st) != 0 ) { err = not_found(dir, name); return false; }
+	bool ok;
+	std::string ps = read_file(pf, ok);
+	if ( !ok ) { err = "cannot read " + pf; return false; }
+	JSON p;
+	try { p = JSON::parse(ps); }
+	catch ( const std::exception& e ) { err = std::string("profile ") + name + ": " + e.what(); return false; }
+	collect_info(p, name, out);
+	return true;
+}
+
+bool profile(const std::string& config_path, const std::string& dir, const std::string& name,
+             ProfileInfo* info, std::string& err) {
+	std::string pf = dir + "/" + name + ".json";
+	struct stat st;
+	if ( stat(pf.c_str(), &st) != 0 ) { err = not_found(dir, name); return false; }
 
 	bool ok;
 	std::string cs = read_file(config_path, ok);
@@ -174,7 +358,27 @@ bool profile(const std::string& config_path, const std::string& dir, const std::
 	try { base = JSON::parse(cs); ovl = JSON::parse(ps); }
 	catch ( const std::exception& e ) { err = std::string("profile merge: ") + e.what(); return false; }
 
-	JSON merged = strip_underscore(deepmerge(base, ovl));
+	ProfileInfo pi;
+	collect_info(ovl, name, pi);
+
+	JSON merged = deepmerge(base, ovl);
+	apply_caps_add(merged, pi.caps_add);
+	drop_absent_optional(merged);
+	merged = strip_underscore(merged);
+
+	if ( !pi.description.empty()) logger::info << "    " << pi.description << std::endl;
+	if ( !pi.caps_add.empty()) {
+		std::string s;
+		for ( const std::string& c : pi.caps_add ) s += ( s.empty() ? "" : " " ) + c;
+		logger::info << "    capabilities added: " << s << std::endl;
+	}
+	// A profile that hands over its own capability sets REPLACES them; say so,
+	// because narrowing them is exactly how a container ends up unable to chown.
+	if ( ovl.contains("process") && ovl["process"].type() == JSON::TYPE::OBJECT &&
+	     ovl["process"].contains("capabilities"))
+		logger::info << "    note: this profile REPLACES the capability set (--caps is ignored)" << std::endl;
+
+	if ( info ) *info = pi;
 	return write_file(config_path, merged.dump(true) + "\n", err);
 }
 

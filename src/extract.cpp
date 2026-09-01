@@ -1,5 +1,6 @@
 #include "extract.hpp"
 #include "work.hpp"
+#include "space.hpp"
 
 #include <string>
 #include <vector>
@@ -22,6 +23,22 @@ namespace extract {
 
 enum Fmt { GZIP, ZSTD, XZ, PLAIN };
 
+// One message for every failed write: ENOSPC is by far the common one, and a
+// bare "write error" sends people hunting for a corrupt image instead of a full
+// filesystem. space::low() is the watchdog - it fires while there is still room
+// left, so we stop before the partition (and the box with it) goes down.
+// `partial` = the call wrote SOME of the bytes. A short write is not an error
+// return, so errno was never set for it and would otherwise report whatever
+// failed last (a stale ENOENT from some earlier stat) - on a filesystem that
+// just ran out, the honest answer is "no space".
+static std::string write_fail(const char* what, bool partial = false) {
+	if ( partial && errno != ENOSPC )
+		return std::string(what) + ": no space left on the filesystem (short write)";
+	std::string m = std::string(what) + ": " + std::strerror(errno);
+	if ( errno == ENOSPC ) m += " - the filesystem is full";
+	return m;
+}
+
 static Fmt detect(const std::string& file) {
 	FILE* f = std::fopen(file.c_str(), "rb");
 	if ( !f ) return PLAIN;
@@ -43,7 +60,8 @@ static bool decomp_gzip(const std::string& in, const std::string& out, std::stri
 	int n; bool ok = true;
 	while (( n = gzread(gz, buf, sizeof buf)) > 0 ) {
 		if ( work::cancelled ) { err = "cancelled"; ok = false; break; }
-		if ( std::fwrite(buf, 1, n, of) != (size_t)n ) { err = "write error"; ok = false; break; }
+		if ( errno = 0, std::fwrite(buf, 1, n, of) != (size_t)n ) { err = write_fail("write", true); ok = false; break; }
+		if ( space::low((unsigned long long)n)) { err = space::why(); ok = false; break; }
 	}
 	if ( n < 0 ) { err = "gzip decode error"; ok = false; }
 	gzclose(gz); std::fclose(of);
@@ -67,7 +85,8 @@ static bool decomp_zstd(const std::string& in, const std::string& out, std::stri
 			ZSTD_outBuffer zout{ obuf.data(), outCap, 0 };
 			size_t r = ZSTD_decompressStream(ds, &zout, &zin);
 			if ( ZSTD_isError(r)) { err = std::string("zstd: ") + ZSTD_getErrorName(r); ok = false; break; }
-			if ( std::fwrite(obuf.data(), 1, zout.pos, of) != zout.pos ) { err = "write error"; ok = false; break; }
+			if ( errno = 0, std::fwrite(obuf.data(), 1, zout.pos, of) != zout.pos ) { err = write_fail("write", true); ok = false; break; }
+			if ( space::low(zout.pos)) { err = space::why(); ok = false; break; }
 		}
 		if ( !ok ) break;
 	}
@@ -99,7 +118,8 @@ static bool decomp_xz(const std::string& in, const std::string& out, std::string
 		strm.next_out = obuf; strm.avail_out = sizeof obuf;
 		lzma_ret r = lzma_code(&strm, action);
 		size_t have = sizeof obuf - strm.avail_out;
-		if ( have && std::fwrite(obuf, 1, have, of) != have ) { err = "write error"; ok = false; break; }
+		if ( have && ( errno = 0, std::fwrite(obuf, 1, have, of) != have )) { err = write_fail("write", true); ok = false; break; }
+		if ( space::low(have)) { err = space::why(); ok = false; break; }
 		if ( r == LZMA_STREAM_END ) break;
 		if ( r != LZMA_OK ) { err = "xz decode error"; ok = false; break; }
 		if ( work::cancelled ) { err = "cancelled"; ok = false; break; }
@@ -196,10 +216,12 @@ static void clear_dir(int dfd) {
 	closedir(d);
 }
 
-static bool write_file_at(int pfd, const std::string& base, FILE* tar, unsigned long long size, mode_t mode) {
+static bool write_file_at(int pfd, const std::string& base, FILE* tar, unsigned long long size, mode_t mode,
+                          std::string& why) {
 	unlinkat(pfd, base.c_str(), 0);   // drop any existing symlink/file (overlay: layer replaces)
 	int fd = openat(pfd, base.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_NOFOLLOW, mode & 0777);
 	if ( fd < 0 ) {
+		why = write_fail("create");
 		// consume the entry's data + padding anyway, otherwise the caller's
 		// `continue` leaves the tar stream misaligned (payload read as a header)
 		unsigned long long skip = size + (512 - (size % 512)) % 512;
@@ -212,9 +234,12 @@ static bool write_file_at(int pfd, const std::string& base, FILE* tar, unsigned 
 	while ( left > 0 ) {
 		size_t want = left < sizeof buf ? (size_t)left : sizeof buf;
 		size_t n = std::fread(buf, 1, want, tar);
-		if ( n == 0 ) { ok = false; break; }
-		if ( write(fd, buf, n) != (ssize_t)n ) { ok = false; break; }
+		if ( n == 0 ) { why = "short read from the layer archive"; ok = false; break; }
+		errno = 0;
+		ssize_t w = write(fd, buf, n);
+		if ( w != (ssize_t)n ) { why = write_fail("write", w > 0 && errno == 0); ok = false; break; }
 		left -= n;
+		if ( space::low((unsigned long long)n)) { why = space::why(); ok = false; break; }
 	}
 	close(fd);
 	unsigned long long pad = (512 - (size % 512)) % 512;   // skip to the 512-byte block boundary
@@ -341,10 +366,12 @@ static bool extract_tar(const std::string& tarfile, const std::string& rootfs, s
 				}
 				break;
 			}
-			case '0': case '\0': case '7':             // regular file
-				if ( !write_file_at(pfd, bn, f, size, (mode_t)octal(hdr + 100, 8))) { err = "write " + name; ok = false; }
+			case '0': case '\0': case '7': {           // regular file
+				std::string why;
+				if ( !write_file_at(pfd, bn, f, size, (mode_t)octal(hdr + 100, 8), why)) { err = name + ": " + why; ok = false; }
 				close(pfd);
 				continue;                              // write_file_at consumed the data + padding
+			}
 			default:                                   // char/block/fifo: skip data, don't create device nodes
 				break;
 		}

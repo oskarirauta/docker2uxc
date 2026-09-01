@@ -1,14 +1,28 @@
 {
-  "_comment": "PostgreSQL overlay. Apply with --profile postgres. Arrays APPEND to the base config; EDIT the data bind 'source' to a host path (it must exist). See profiles/README.md.",
-  "_comment_shm": "Postgres needs more shared memory than the OCI default 64MB; give /dev/shm a real size and raise it for many connections / large work_mem.",
-  "_comment_env": "Set POSTGRES_PASSWORD (or POSTGRES_HOST_AUTH_METHOD) in the container's registry 'env' - NOT here, this file is shared. TZ is a convenience.",
+  "_description": "PostgreSQL: data bind, a real /dev/shm (the OCI default 64 MB is too small), and a TCP health check on 5432.",
+
+  "_comment": "EDIT the data volume path below. Set POSTGRES_PASSWORD (or POSTGRES_HOST_AUTH_METHOD) in the container's registry 'env' - LuCI: Configure -> Environment - NOT in this file, which is shared by every postgres container.",
+
+  "_comment_caps": "The entrypoint initialises the data dir and then runs the server as the 'postgres' user. Listed so the profile also works with --caps minimal.",
+  "_caps_add": [ "CAP_CHOWN", "CAP_FOWNER", "CAP_DAC_OVERRIDE", "CAP_SETUID", "CAP_SETGID" ],
+
   "process": {
-    "env": ["TZ=UTC"]
+    "env": [ "TZ=UTC" ]
   },
-  "mounts": [
-    { "destination": "/dev/shm", "type": "tmpfs", "source": "tmpfs",
-      "options": ["nosuid", "nodev", "mode=1777", "size=256m"] },
-    { "destination": "/var/lib/postgresql/data", "type": "bind", "source": "/srv/CHANGEME/postgres",
-      "options": ["rbind", "rw"] }
-  ]
+
+  "_registry": {
+    "_comment_shm": "Postgres uses shared memory for parallel query workers; raise this for many connections or a large work_mem. It is RAM.",
+    "shm_size": "256m",
+    "_comment_volumes": "EDIT THIS.",
+    "volumes": [ "/srv/postgres:/var/lib/postgresql/data" ],
+    "healthcheck": {
+      "checks": [ { "type": "tcp", "target": "127.0.0.1:5432" } ],
+      "interval": 30,
+      "retries": 3,
+      "start_period": 30
+    },
+    "respawn": true,
+    "urls": [ "https://hub.docker.com/_/postgres" ],
+    "notes": "First start initialises the data dir and needs POSTGRES_PASSWORD in env. Back up with pg_dump from inside the container (uxe postgres)."
+  }
 }

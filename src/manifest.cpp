@@ -77,6 +77,8 @@ bool resolve(const ImageRef& ref, const std::string& arch_base, const std::strin
 			Layer L;
 			L.digest     = e.contains("digest")    ? e["digest"].to_string()    : "";
 			L.media_type = e.contains("mediaType") ? e["mediaType"].to_string() : "";
+			// declared blob size - what the disk preflight budgets against
+			if ( e.contains("size")) L.size = e["size"].to_number();
 			if ( !L.digest.empty()) out.layers.push_back(L);
 		}
 	} catch ( const std::exception& ex ) {

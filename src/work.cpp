@@ -3,6 +3,8 @@
 #include <csignal>
 #include <cstring>
 #include <cstdio>
+#include <cstdlib>
+#include <vector>
 #include <unistd.h>
 #include <ftw.h>
 #include <sys/mount.h>
@@ -27,10 +29,23 @@ static int rm_entry(const char* p, const struct stat*, int, struct FTW*) {
 	return 0;
 }
 
-Dir::Dir() {
-	char tmpl[] = "/tmp/docker2uxc-work-XXXXXX";
-	char* d = mkdtemp(tmpl);
-	if ( d ) path_ = d;
+Dir::Dir(const std::string& base) {
+	// The scratch dir holds a whole DECOMPRESSED layer at a time (gigabytes for
+	// an image like Frigate). On OpenWrt /tmp is a RAM tmpfs, so the caller can
+	// hand us the bundle's filesystem instead and keep that out of memory.
+	std::string b = base;
+	if ( b.empty()) { const char* e = getenv("TMPDIR"); if ( e && *e ) b = e; }
+	if ( b.empty()) b = "/tmp";
+	while ( b.size() > 1 && b.back() == '/' ) b.pop_back();
+
+	std::string tmpl = b + "/docker2uxc-work-XXXXXX";
+	std::vector<char> buf(tmpl.begin(), tmpl.end());
+	buf.push_back('\0');
+	char* d = mkdtemp(buf.data());
+	if ( d ) { path_ = d; return; }
+	if ( b == "/tmp" ) return;
+	char fallback[] = "/tmp/docker2uxc-work-XXXXXX";     // e.g. a read-only bundle parent
+	if (( d = mkdtemp(fallback))) path_ = d;
 }
 
 Dir::~Dir() { cleanup(); }
