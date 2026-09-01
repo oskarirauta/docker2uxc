@@ -1,6 +1,9 @@
 {
   "_description": "One line describing what this profile is for - shown by `uxc profiles` and in the LuCI dropdown.",
 
+  "_comment_matches": "Image repository names this profile is for. A pull without --profile that matches one of these says so, and the LuCI dropdown preselects it. Registry host and tag are ignored, so one entry covers docker.io, ghcr.io and a private mirror.",
+  "_matches": [ "CHANGEME" ],
+
   "_comment": "Boilerplate profile. Copy to <name>.json and apply with --profile <name>. Every key starting with '_' is a directive or a comment and never reaches config.json. Merge rules: objects merge recursively, mounts merge BY DESTINATION, other arrays append, scalars replace. See profiles/README.md.",
 
   "_comment_caps": "Capabilities ADDED on top of the --caps set. This is what you almost always want. (Writing process.capabilities instead REPLACES the whole set - that scopes a container down, but forget CAP_CHOWN and its init dies on the first chown.)",

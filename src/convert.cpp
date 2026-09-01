@@ -581,6 +581,18 @@ bool convert(Options& o, std::string& err) {
 	if ( !o.profile.empty()) {
 		logger::info << "==> applying profile: " << o.profile << std::endl;
 		if ( !emit::profile(out + "/config.json", emit::profile_dir(), o.profile, &pinfo, err)) return false;
+	} else if ( !df_mode ) {
+		// Nobody knows a profile exists until they need one. Say so, rather than
+		// letting the container fail later for want of a capability or a device.
+		std::string m = emit::match_profile(emit::profile_dir(), o.image);
+		if ( !m.empty()) {
+			emit::ProfileInfo mi;
+			std::string merr;
+			emit::profile_info(emit::profile_dir(), m, mi, merr);
+			logger::info << "note: the '" << m << "' profile is meant for this image"
+			             << ( mi.description.empty() ? "" : " - " + mi.description ) << std::endl;
+			logger::info << "      re-run with --profile " << m << " to apply it" << std::endl;
+		}
 	}
 
 	copy_file(cfgblob, out + "/image-config.json");

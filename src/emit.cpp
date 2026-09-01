@@ -164,6 +164,10 @@ void collect_info(const JSON& p, const std::string& name, ProfileInfo& info) {
 		info.registry = strip_underscore(p["_registry"]);
 	if ( p.contains("_seed") && p["_seed"].type() == JSON::TYPE::OBJECT )
 		info.seed = p["_seed"];
+	if ( p.contains("_matches") && p["_matches"].type() == JSON::TYPE::ARRAY ) {
+		const JSON ma = p["_matches"];
+		for ( auto it = ma.begin(); it != ma.end(); ++it ) info.matches.push_back(it.value().to_string());
+	}
 	// NOTE: JSON's const operator[] returns BY VALUE, so every loop below binds
 	// the array to a local first - begin() and end() taken from two separate
 	// temporaries do not compare.
@@ -340,6 +344,33 @@ bool profile_info(const std::string& dir, const std::string& name, ProfileInfo& 
 	catch ( const std::exception& e ) { err = std::string("profile ") + name + ": " + e.what(); return false; }
 	collect_info(p, name, out);
 	return true;
+}
+
+std::string match_profile(const std::string& dir, const std::string& image_ref) {
+	if ( image_ref.empty()) return "";
+	// strip the tag/digest, then the registry host, leaving "blakeblackshear/frigate"
+	std::string repo = image_ref;
+	std::string::size_type at = repo.find('@');
+	if ( at != std::string::npos ) repo = repo.substr(0, at);
+	std::string::size_type slash = repo.find('/');
+	std::string::size_type colon = repo.rfind(':');
+	if ( colon != std::string::npos && ( slash == std::string::npos || colon > slash )) repo = repo.substr(0, colon);
+	// a first component with a dot or a port is a registry host, not a namespace
+	std::string::size_type s = repo.find('/');
+	if ( s != std::string::npos ) {
+		std::string head = repo.substr(0, s);
+		if ( head.find('.') != std::string::npos || head.find(':') != std::string::npos ) repo = repo.substr(s + 1);
+	}
+	std::string leaf = repo.substr(repo.find_last_of('/') == std::string::npos ? 0 : repo.find_last_of('/') + 1);
+
+	for ( const std::string& n : profile_names(dir)) {
+		ProfileInfo pi;
+		std::string perr;
+		if ( !profile_info(dir, n, pi, perr)) continue;
+		for ( const std::string& m : pi.matches )
+			if ( m == leaf || m == repo ) return n;
+	}
+	return "";
 }
 
 bool profile(const std::string& config_path, const std::string& dir, const std::string& name,

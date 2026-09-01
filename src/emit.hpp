@@ -23,7 +23,15 @@ struct ProfileInfo {
 	std::vector<std::string> needs;       // host paths that must exist before a start
 	std::vector<std::string> devices;     // devices the profile passes through
 	std::vector<std::string> caps_add;    // capabilities added on top of --caps
+	std::vector<std::string> matches;     // "_matches": image repo names this profile is for
 };
+
+// Which profile in `dir` is meant for `image_ref`, or "". Matching is on the
+// image's repository path: a profile's "_matches" entry hits when it equals the
+// repo's last component ("frigate" for ghcr.io/blakeblackshear/frigate:0.18) or
+// the whole repo path. Registry host and tag are ignored, so the same profile
+// covers docker.io, ghcr.io and a private mirror.
+std::string match_profile(const std::string& dir, const std::string& image_ref);
 
 // Read <dir>/<name>.json WITHOUT applying it - for `uxc profiles` and the LuCI
 // dropdown, so a user can see what a profile does before choosing it.

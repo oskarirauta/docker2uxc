@@ -1,6 +1,8 @@
 {
   "_description": "Eclipse Mosquitto MQTT broker: config/data binds, a TCP health check on 1883, and the capabilities its entrypoint needs to drop privileges.",
 
+  "_matches": [ "eclipse-mosquitto", "mosquitto" ],
+
   "_comment": "EDIT the two volume paths below. Put a mosquitto.conf in the config dir before the first start - without one the broker only listens on localhost. Add 'persistence true' + 'persistence_location /mosquitto/data/' to keep retained messages.",
 
   "_comment_caps": "The entrypoint chowns /mosquitto and then re-executes the broker as the unprivileged 'mosquitto' user, which needs CAP_CHOWN + CAP_SETUID/CAP_SETGID + CAP_DAC_OVERRIDE. Those are in the default (permissive) set; listing them here keeps the profile working with --caps minimal too.",

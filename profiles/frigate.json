@@ -1,6 +1,8 @@
 {
   "_description": "Frigate NVR: adds the capabilities its s6 init needs, passes through the iGPU and USB Coral, sizes /dev/shm, and pre-fills the health check.",
 
+  "_matches": [ "frigate" ],
+
   "_comment": "EDIT the two volume paths below to your host layout, then `uxc start frigate`. Everything else is meant to work as-is. See profiles/README.md and docs/frigate.md.",
 
   "_comment_caps": "ADDED on top of the --caps set (never replacing it). Frigate's s6-overlay init chowns /dev/shm/logs and remounts things: with anything less than the full permissive set PLUS these two it dies during startup with 'Operation not permitted'. CAP_SYS_ADMIN = s6 mount work, CAP_PERFMON = hardware-accelerated detectors.",

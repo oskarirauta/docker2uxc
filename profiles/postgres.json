@@ -1,6 +1,8 @@
 {
   "_description": "PostgreSQL: data bind, a real /dev/shm (the OCI default 64 MB is too small), and a TCP health check on 5432.",
 
+  "_matches": [ "postgres", "postgresql" ],
+
   "_comment": "EDIT the data volume path below. Set POSTGRES_PASSWORD (or POSTGRES_HOST_AUTH_METHOD) in the container's registry 'env' - LuCI: Configure -> Environment - NOT in this file, which is shared by every postgres container.",
 
   "_comment_caps": "The entrypoint initialises the data dir and then runs the server as the 'postgres' user. Listed so the profile also works with --caps minimal.",
