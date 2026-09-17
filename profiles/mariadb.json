@@ -50,6 +50,8 @@
     "_comment_volumes": "EDIT THIS if /srv is not where your data lives. The data dir is a SUBdirectory of the bind, so the env file next to it never ends up inside the data directory.",
     "volumes": [ "/srv/mariadb/data:/var/lib/mysql" ],
     "env_file": [ "/srv/mariadb/env" ],
+    "_comment_tmpfs": "The image ships /run/mysqld (its socket + pid directory), and the bundle mounts a fresh tmpfs over /run - which hides it, and the entrypoint dies with `find: '/run/mysqld': No such file or directory`. A tmpfs of its own at that path restores it.",
+    "tmpfs": [ "/run/mysqld" ],
     "_comment_health": "Probed inside the container's own network namespace, so 127.0.0.1 is correct both on the host stack and in a shared infra netns.",
     "healthcheck": {
       "checks": [ { "type": "tcp", "target": "127.0.0.1:3306" } ],
