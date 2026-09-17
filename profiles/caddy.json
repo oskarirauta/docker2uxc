@@ -1,0 +1,113 @@
+{
+  "_description": "Caddy web server / reverse proxy: automatic HTTPS, persistent certificate storage, and a PHP-FPM pairing ready to uncomment.",
+
+  "_matches": [ "caddy" ],
+
+  "_comment": "A RECIPE: `uxc deploy caddy` pulls the image, creates /srv/caddy, writes a starting Caddyfile, and registers the volumes + health check. Edit /srv/caddy/Caddyfile (set your domain and e-mail), then `uxc start caddy`. Upgrades follow the 2-alpine tag: `uxc upgrade caddy` re-pulls, health-gates the restart and rolls back to .prev if the new version does not come up.",
+
+  "_source": {
+    "_comment_image": "The official image. A major-version tag (not :latest) so an upgrade is a patch/minor move, never a surprise jump to Caddy 3.",
+    "image": "caddy:2-alpine"
+  },
+
+  "_comment_paths": "Created before the first start, so the container never fails on a missing bind source. /srv/caddy/storage holds the ACME account key and the issued certificates - back THAT up, or every redeploy re-issues certificates and eventually hits Let's Encrypt rate limits.",
+  "_paths": [
+    { "path": "/srv/caddy",         "mode": "0755" },
+    { "path": "/srv/caddy/data",    "mode": "0755" },
+    { "path": "/srv/caddy/config",  "mode": "0755" },
+    { "path": "/srv/caddy/logs",    "mode": "0755" },
+    { "path": "/srv/caddy/storage", "mode": "0700" },
+    { "path": "/srv/htdocs",        "mode": "0755" }
+  ],
+
+  "_comment_seed": "Written only when the file does not exist - your edited Caddyfile is never touched by a redeploy or an upgrade. The :80 health endpoint is what uxcd's health check hits, and what makes a safe upgrade able to verify the new version.",
+  "_seed": {
+    "/srv/caddy/Caddyfile": [
+      "# Starting Caddyfile written by `uxc deploy caddy`. EDIT ME.",
+      "#",
+      "# 1. replace example.org with your domain and set a real e-mail address",
+      "# 2. point DNS at this box and open 80/443 in the firewall (fw4 owns that,",
+      "#    uxcd does not touch it)",
+      "# 3. uxc restart caddy",
+      "#",
+      "# Certificates live in /var/storage (-> /srv/caddy/storage) so they survive",
+      "# a container rebuild. Docs: https://caddyserver.com/docs/caddyfile",
+      "",
+      "{",
+      "\temail you@example.org",
+      "\tadmin off",
+      "\tstorage file_system /var/storage",
+      "\tlog default {",
+      "\t\toutput file /var/log/caddy.log {",
+      "\t\t\troll_size 512KiB",
+      "\t\t\troll_keep 2",
+      "\t\t}",
+      "\t\tformat json",
+      "\t\tlevel INFO",
+      "\t}",
+      "}",
+      "",
+      "# Health endpoint on plain HTTP: uxcd's health check and the safe-upgrade",
+      "# gate use this. Keep it, or the upgrade cannot verify a new version.",
+      ":80 {",
+      "\thandle /healthz {",
+      "\t\trespond \"ok\" 200",
+      "\t}",
+      "\thandle {",
+      "\t\tredir https://example.org{uri} permanent",
+      "\t}",
+      "}",
+      "",
+      "example.org {",
+      "\troot * /var/htdocs/www",
+      "\tencode zstd gzip",
+      "",
+      "\t# PHP? deploy the php-fpm recipe too and uncomment this line. Both",
+      "\t# containers must share a network - the host stack (the default) or one",
+      "\t# infra netns (`uxc deploy caddy --infra cntr`).",
+      "\t# php_fastcgi 127.0.0.1:9000",
+      "",
+      "\tfile_server",
+      "",
+      "\theader {",
+      "\t\tStrict-Transport-Security \"max-age=31536000\"",
+      "\t\tX-Content-Type-Options nosniff",
+      "\t\tX-Frame-Options DENY",
+      "\t}",
+      "\tlog {",
+      "\t\toutput file /var/log/site.log {",
+      "\t\t\troll_size 512KiB",
+      "\t\t\troll_keep 2",
+      "\t\t}",
+      "\t}",
+      "}"
+    ]
+  },
+
+  "_comment_registry": "The uxcd half: binds, health check, web links. Only keys the entry does not already have are written, so your edits survive every redeploy and upgrade.",
+  "_registry": {
+    "volumes": [
+      "/srv/caddy/Caddyfile:/etc/caddy/Caddyfile:ro",
+      "/srv/caddy/data:/data",
+      "/srv/caddy/config:/config",
+      "/srv/caddy/logs:/var/log",
+      "/srv/caddy/storage:/var/storage",
+      "/srv/htdocs:/var/htdocs/www:ro"
+    ],
+    "respawn": true,
+    "web_ports": [
+      { "port": 443, "scheme": "https" },
+      { "port": 80 }
+    ],
+    "healthcheck": {
+      "interval": 30,
+      "retries": 3,
+      "start_period": 15,
+      "checks": [
+        { "type": "http", "target": "127.0.0.1:80/healthz" }
+      ]
+    },
+    "urls": [ "https://caddyserver.com/docs/caddyfile" ],
+    "notes": "Deployed from the 'caddy' recipe. Config: /srv/caddy/Caddyfile (bind-mounted read-only; `uxc restart caddy` to apply). ACME certificates and the account key live in /srv/caddy/storage - back it up; losing it re-issues everything. The health check needs the :80 /healthz block in the Caddyfile. For a PHP site, deploy the php-fpm recipe and uncomment php_fastcgi 127.0.0.1:9000; the two containers must share a network (host, or the same --infra netns)."
+  }
+}

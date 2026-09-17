@@ -1,5 +1,6 @@
 #pragma once
 #include <string>
+#include <vector>
 #include "json.hpp"
 
 // Bundle-side output generators: profile overlay + the optional /etc/config
@@ -12,6 +13,18 @@ namespace emit {
 // (dev tree), else /usr/share/docker2uxc/profiles.
 std::string profile_dir();
 
+// A host directory a recipe needs before its container can start, with the
+// ownership the containerised service expects. uxcd creates a missing bind
+// source, but it cannot know that PHP-FPM's webroot must belong to uid 82 -
+// which is exactly the kind of detail that turns a "20 minute" redeploy into a
+// day of debugging permission errors.
+struct PathSpec {
+	std::string path;
+	std::string mode;          // "0755"; empty = leave the default
+	long long uid = -1;        // -1 = leave alone
+	long long gid = -1;
+};
+
 // Everything a profile says that is NOT part of the OCI config.json: the human
 // description, the uxcd registry fields it seeds, and the host paths its binds
 // and volumes need to exist. Filled by profile() and profile_info().
@@ -20,6 +33,8 @@ struct ProfileInfo {
 	std::string description;              // "_description"
 	JSON registry = JSON::Object();       // "_registry": seeded into <uxc_dir>/<name>.json
 	JSON seed = JSON::Object();           // "_seed": { host path: contents } written only when absent
+	JSON source = JSON::Object();         // "_source": how to CREATE the container (recipe half; see recipe.hpp)
+	std::vector<PathSpec> paths;          // "_paths": host dirs to create with the right owner/mode
 	std::vector<std::string> needs;       // host paths that must exist before a start
 	std::vector<std::string> devices;     // devices the profile passes through
 	std::vector<std::string> caps_add;    // capabilities added on top of --caps
@@ -65,6 +80,13 @@ bool profile(const std::string& config_path, const std::string& dir, const std::
 // config file must exist before its first run (mosquitto.conf, ...) gets a
 // commented starting point instead of a crash loop. Returns the paths written.
 std::vector<std::string> seed_files(const JSON& seed);
+
+// Create a profile's "_paths" host directories with their stated mode/owner. An
+// existing directory keeps its contents; its mode/owner are applied only when
+// the recipe states them, so a redeploy repairs ownership without touching data.
+// Returns the paths created (an existing one is not reported). Failures are
+// logged, never fatal: an unreadable /srv is the operator's to fix.
+std::vector<std::string> ensure_paths(const std::vector<PathSpec>& paths);
 
 // Write <out>/network.uci - an /etc/config/network veth/bridge/infra snippet for
 // an isolated container. Never applied automatically.

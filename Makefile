@@ -22,6 +22,7 @@ OBJS:= \
 	objs/dockerfile.o \
 	objs/emit.o \
 	objs/space.o \
+	objs/recipe.o \
 	objs/convert.o \
 	objs/main.o
 
@@ -86,6 +87,9 @@ objs/space.o: src/space.cpp
 	$(CXX) $(CXXFLAGS) $(INCLUDES) -c -o $@ $<;
 
 objs/convert.o: src/convert.cpp
+	$(CXX) $(CXXFLAGS) $(INCLUDES) -c -o $@ $<;
+
+objs/recipe.o: src/recipe.cpp
 	$(CXX) $(CXXFLAGS) $(INCLUDES) -c -o $@ $<;
 
 # libraries AFTER the objects (--as-needed toolchains)

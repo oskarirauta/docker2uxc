@@ -1,0 +1,82 @@
+{
+  "_description": "PHP-FPM on Alpine with the extensions a real CMS needs (gd with JPEG/PNG/WebP/FreeType, zip, intl, exif) compiled in, listening on 127.0.0.1:9000.",
+
+  "_matches": [ "php" ],
+
+  "_comment": "A RECIPE: `uxc deploy php-fpm` builds the image from the Dockerfile below, creates /srv/php-fpm + the webroot with the right owner, writes a pool override and registers the container. Pair it with the caddy (or nginx) recipe. NOTE: this is a BUILD, not a pull - the stock php:fpm-alpine image has none of these extensions, so uxcd records build provenance and `uxc upgrade php-fpm` RE-BUILDS on the current base image instead of pulling the stock one over it.",
+
+  "_source": {
+    "_comment_base": "The tracked base image. check_updates re-resolves this tag and reports a rebuild when it moves; ${base} below expands to it, so the FROM line and the tracked ref can never drift apart. Pin a full version (php:8.5.10-fpm-alpine) if you want to move deliberately.",
+    "build": {
+      "base": "php:8.5-fpm-alpine",
+      "_comment_dockerfile": "A plain, standard Dockerfile - it builds with docker/podman too. The build-only deps go in a virtual package and are deleted again, so the layer stays small. -j2 keeps the compile inside a router's RAM.",
+      "dockerfile": [
+        "FROM ${base}",
+        "RUN apk add --no-cache freetype libjpeg-turbo libpng libwebp libzip icu-libs \\",
+        " && apk add --no-cache --virtual .build-deps $PHPIZE_DEPS freetype-dev libjpeg-turbo-dev libpng-dev libwebp-dev libzip-dev icu-dev \\",
+        " && docker-php-ext-configure gd --with-freetype --with-jpeg --with-webp \\",
+        " && docker-php-ext-install -j2 gd zip intl exif \\",
+        " && apk del .build-deps"
+      ]
+    }
+  },
+
+  "_comment_paths": "PHP runs as uid/gid 82 (www-data on Alpine). The webroot must be writable by it or the application fails in ways that look like anything but a permission problem - this is exactly the detail a redeploy otherwise loses.",
+  "_paths": [
+    { "path": "/srv/php-fpm",      "mode": "0755" },
+    { "path": "/srv/php-fpm/conf", "mode": "0755" },
+    { "path": "/srv/htdocs",       "mode": "0755", "uid": 82, "gid": 82 }
+  ],
+
+  "_comment_seed": "The pool override. Written only when absent, so your tuning survives a redeploy.",
+  "_seed": {
+    "/srv/php-fpm/conf/zz-site.conf": [
+      "; Pool override written by `uxc deploy php-fpm`. EDIT ME.",
+      "; Loaded after the stock pool config, so these win.",
+      "[www]",
+      "user = 82",
+      "group = 82",
+      "listen = 127.0.0.1:9000",
+      "",
+      "; Process manager: 'dynamic' suits a box serving a handful of sites.",
+      "; On a small router 'ondemand' with a low max_children uses less RAM.",
+      "pm = dynamic",
+      "pm.max_children = 10",
+      "pm.start_servers = 2",
+      "pm.min_spare_servers = 1",
+      "pm.max_spare_servers = 3",
+      "pm.max_requests = 500",
+      "",
+      "; Send the workers' output to the container log (`uxc log php-fpm`).",
+      "catch_workers_output = yes",
+      "decorate_workers_output = no",
+      "",
+      "php_admin_value[memory_limit] = 256M",
+      "php_admin_value[upload_max_filesize] = 32M",
+      "php_admin_value[post_max_size] = 32M",
+      "php_admin_value[max_execution_time] = 60",
+      "; php_admin_value[date.timezone] = Europe/Helsinki"
+    ]
+  },
+
+  "_registry": {
+    "volumes": [
+      "/srv/htdocs:/var/htdocs/www",
+      "/srv/php-fpm/conf/zz-site.conf:/usr/local/etc/php-fpm.d/zz-site.conf:ro"
+    ],
+    "respawn": true,
+    "_comment_stop": "php-fpm's graceful shutdown signal: SIGTERM kills requests in flight.",
+    "stop_signal": "SIGQUIT",
+    "_comment_health": "Checked from INSIDE the container, so it works the same whether the container is on the host stack or in an infra netns.",
+    "healthcheck": {
+      "interval": 30,
+      "retries": 3,
+      "start_period": 15,
+      "checks": [
+        { "type": "exec", "command": [ "/bin/sh", "-c", "nc -z 127.0.0.1 9000" ], "timeout": 5 }
+      ]
+    },
+    "urls": [ "https://www.php.net/manual/en/install.fpm.configuration.php" ],
+    "notes": "Deployed from the 'php-fpm' recipe - a BUILD, not a pull: gd/zip/intl/exif are compiled in and the stock php:fpm-alpine image does NOT have them. `uxc upgrade php-fpm` rebuilds from the recorded Dockerfile (/srv/php-fpm.Dockerfile) on the current base image; never replace the bundle with a plain image pull. Pool override: /srv/php-fpm/conf/zz-site.conf. Webroot /srv/htdocs is owned by 82:82. Needs a web server in front (the caddy recipe) sharing the same network - the host stack, or the same --infra netns."
+  }
+}

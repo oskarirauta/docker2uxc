@@ -36,6 +36,7 @@ struct Options {
 	bool dev              = false;     // dev container: idle cntrinit init + writable persistent overlay
 	std::string cntrinit  = "/usr/bin/cntrinit";  // static init copied into the bundle for --dev
 	std::string profile;               // profiles/<profile>.json overlay
+	std::string recipe;                // recipe this build/pull came from (recorded as build.recipe / provenance)
 
 	// optional emitters
 	bool emit_netconfig = false;

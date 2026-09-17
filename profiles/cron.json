@@ -1,0 +1,102 @@
+{
+  "_description": "Scheduled jobs in a container: Alpine + BusyBox crond in the foreground, PHP CLI available, crontabs and scripts bind-mounted from the host.",
+
+  "_matches": [ "alpine" ],
+
+  "_comment": "A RECIPE: `uxc deploy cron` builds a small Alpine image with crond + PHP CLI, creates /srv/cron/{crontabs,scripts,state}, seeds an example crontab and a health-check script, and registers the container. This is for a job that must run INSIDE a container next to your application (a CMS scheduler, a cache purge). uxcd's own per-container schedules restart/stop/start whole containers instead - see docs/configuration.md; the two do not overlap.",
+
+  "_source": {
+    "build": {
+      "base": "alpine:3.24",
+      "_comment_dockerfile": "PHP CLI + the extension set a CMS scheduler usually wants, plus flock and tzdata. Drop the php85-* packages if your jobs are shell only. Alpine's php85-* packages install in seconds - unlike compiling extensions, which is why this container builds fast even on a router.",
+      "dockerfile": [
+        "FROM ${base}",
+        "RUN apk add --no-cache \\",
+        "      php85 php85-phar php85-mbstring php85-iconv php85-openssl php85-curl \\",
+        "      php85-zip php85-dom php85-simplexml php85-xml php85-xmlreader php85-xmlwriter \\",
+        "      php85-gd php85-intl php85-exif php85-fileinfo php85-session php85-tokenizer \\",
+        "      php85-ctype php85-pdo php85-pdo_sqlite php85-sodium php85-posix \\",
+        "      tzdata ca-certificates curl flock \\",
+        " && adduser -D -H -h /var/htdocs/www -u 82 -G www-data site",
+        "ENV TZ=UTC",
+        "CMD [\"/usr/sbin/crond\", \"-f\", \"-l\", \"8\", \"-L\", \"/dev/stdout\", \"-c\", \"/etc/crontabs\"]"
+      ]
+    }
+  },
+
+  "_paths": [
+    { "path": "/srv/cron",          "mode": "0755" },
+    { "path": "/srv/cron/crontabs", "mode": "0755" },
+    { "path": "/srv/cron/scripts",  "mode": "0755" },
+    { "path": "/srv/cron/state",    "mode": "0755", "uid": 82, "gid": 82 },
+    { "path": "/srv/htdocs",        "mode": "0755", "uid": 82, "gid": 82 }
+  ],
+
+  "_comment_seed": "An example job and the health-check script. Both are written only when absent. The crontab file name IS the user the jobs run as - 'root' here, with the job itself dropping to uid 82 via su.",
+  "_seed": {
+    "/srv/cron/crontabs/root": [
+      "# Crontab written by `uxc deploy cron`. EDIT ME.",
+      "# BusyBox crond: min hour day month weekday command",
+      "#",
+      "# The example below runs every minute and only touches the state file the",
+      "# health check looks at, so a fresh container is healthy out of the box.",
+      "# Replace it with your real job; keep (or update) the touch, or the health",
+      "# check will report unhealthy after ten minutes.",
+      "*/1 * * * * /opt/jobs/example",
+      "",
+      "# A CMS scheduler as uid 82, one at a time, capped at 5 minutes:",
+      "# */1 * * * * su -s /bin/sh site -c 'flock -n /state/site.lock timeout 300 php85 /var/htdocs/www/bin/... '",
+      ""
+    ],
+    "/srv/cron/scripts/example": {
+      "mode": "0755",
+      "content": [
+        "#!/bin/sh",
+        "# Example job written by `uxc deploy cron`. Replace with your own.",
+        "# Records a successful run for the health check.",
+        "set -eu",
+        "mkdir -p /state",
+        "date +%s > /state/last-run",
+        "echo \"cron: example job ran at $(date -Is)\""
+      ]
+    },
+    "/srv/cron/scripts/healthcheck": {
+      "mode": "0755",
+      "content": [
+        "#!/bin/sh",
+        "# Health check written by `uxc deploy cron`.",
+        "# Unhealthy when crond is not running, or when no job has recorded a",
+        "# successful run in the last 10 minutes - a crond that is up but whose",
+        "# jobs all fail is not a healthy scheduler.",
+        "set -eu",
+        "pgrep crond >/dev/null 2>&1 || { echo 'crond is not running'; exit 1; }",
+        "[ -f /state/last-run ] || { echo 'no job has run yet'; exit 1; }",
+        "last=$(cat /state/last-run 2>/dev/null || echo 0)",
+        "now=$(date +%s)",
+        "age=$(( now - last ))",
+        "[ \"$age\" -le 600 ] || { echo \"last successful run was ${age}s ago\"; exit 1; }",
+        "echo \"ok (last run ${age}s ago)\""
+      ]
+    }
+  },
+
+  "_registry": {
+    "volumes": [
+      "/srv/cron/crontabs:/etc/crontabs:ro",
+      "/srv/cron/scripts:/opt/jobs:ro",
+      "/srv/cron/state:/state",
+      "/srv/htdocs:/var/htdocs/www"
+    ],
+    "respawn": true,
+    "_comment_health": "start_period covers the first minute, before any job has had a chance to run.",
+    "healthcheck": {
+      "interval": 60,
+      "start_period": 120,
+      "retries": 3,
+      "checks": [
+        { "type": "exec", "command": [ "/opt/jobs/healthcheck" ], "timeout": 5 }
+      ]
+    },
+    "notes": "Deployed from the 'cron' recipe. Crontabs: /srv/cron/crontabs (the FILE NAME is the user the jobs run as); scripts: /srv/cron/scripts (must be executable); run state: /srv/cron/state. The health check needs a job to touch /state/last-run at least every 10 minutes. Set TZ in the registry env if UTC is wrong for your jobs. Job output goes to the container log: `uxc log cron`. Test a job by hand with `uxe cron /opt/jobs/<name>`."
+  }
+}

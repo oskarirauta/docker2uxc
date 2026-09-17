@@ -349,13 +349,40 @@ bool check_updates(const std::string& uxc_dir, const std::string& auth_file, std
 		if ( !f ) continue;
 		std::string s((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
 		std::string image, old;
+		// A Dockerfile-built container follows its BASE image instead: the bundle is
+		// local, so "is there an update" means "has the base moved, or has the recipe
+		// been edited" - and the answer is a REBUILD, never a pull (which would
+		// replace the built rootfs with the stock image).
+		bool build_mode = false;
+		std::string df_path, df_hash;
 		try {
 			JSON j = JSON::parse(s);
 			if ( j.type() != JSON::TYPE::OBJECT ) continue;
-			if ( j.contains("image"))  image = j["image"].to_string();
-			if ( j.contains("digest")) old   = j["digest"].to_string();
+			if ( j.contains("build") && j["build"].type() == JSON::TYPE::OBJECT ) {
+				JSON b = j["build"];
+				build_mode = true;
+				if ( b.contains("base"))              image   = b["base"].to_string();
+				if ( b.contains("base_digest"))       old     = b["base_digest"].to_string();
+				if ( b.contains("dockerfile"))        df_path = b["dockerfile"].to_string();
+				if ( b.contains("dockerfile_sha256")) df_hash = b["dockerfile_sha256"].to_string();
+			} else {
+				if ( j.contains("image"))  image = j["image"].to_string();
+				if ( j.contains("digest")) old   = j["digest"].to_string();
+			}
 		} catch ( ... ) { continue; }
-		if ( image.empty() || old.empty()) continue;
+
+		// The recipe itself changed on disk: a rebuild is due regardless of the
+		// registry, and it is reportable without any network at all.
+		bool recipe_changed = false;
+		if ( build_mode && !df_path.empty() && !df_hash.empty()) {
+			std::string herr, now = sha256_file(df_path, herr);
+			if ( !now.empty() && ( "sha256:" + now ) != df_hash ) recipe_changed = true;
+		}
+		if ( image.empty() || old.empty()) {
+			// A build whose recipe moved is still actionable without a resolvable base.
+			if ( recipe_changed ) out += n + "\trebuild\t\n";
+			continue;
+		}
 
 		std::string e2, neu = resolve_digest(image, auth_file, e2);
 
@@ -373,9 +400,12 @@ bool check_updates(const std::string& uxc_dir, const std::string& auth_file, std
 		}
 		std::string extra = newer.empty() ? std::string() : ( "\t" + newer );
 
-		if      ( neu.empty()) out += n + "\terror\t\n";
-		else if ( neu == old ) out += n + "\tcurrent\t" + neu + extra + "\n";
-		else                   out += n + "\tupdate\t"  + neu + extra + "\n";
+		// "rebuild" is "update" for a locally built bundle: same meaning to the
+		// operator, different action for the daemon.
+		const char* moved = build_mode ? "rebuild" : "update";
+		if      ( neu.empty()) out += n + ( recipe_changed ? "\trebuild\t\n" : "\terror\t\n" );
+		else if ( neu == old ) out += n + ( recipe_changed ? "\trebuild\t" : "\tcurrent\t" ) + neu + extra + "\n";
+		else                   out += n + "\t" + moved + "\t"  + neu + extra + "\n";
 	}
 	return true;
 }
@@ -489,12 +519,14 @@ bool convert(Options& o, std::string& err) {
 	// effective base image of the final rootfs (for manifest.json / notes / provenance)
 	ImageRef    eff_ref;
 	std::string eff_manifest, eff_cfgdigest, eff_prov;
+	std::string eff_base_ref;             // build mode: the FROM ref as written, for a rebuild
 	std::string cfgblob;                  // path to the final image-config blob
 
 	if ( df_mode ) {
 		std::vector<std::string> st_rootfs(stages.size()), st_cfg(stages.size());
 		std::vector<ImageRef>    st_ref(stages.size());
 		std::vector<std::string> st_manifest(stages.size()), st_cfgdigest(stages.size()), st_prov(stages.size());
+		std::vector<std::string> st_baseref(stages.size());   // the FROM ref as written (chased through FROM <stage>)
 		std::vector<char>        freed(stages.size(), 0);
 		std::vector<int>         last_use = dockerfile::stage_last_use(stages);
 		std::vector<dockerfile::BuiltStage> built;
@@ -520,12 +552,14 @@ bool convert(Options& o, std::string& err) {
 				if ( !copy_file(st_cfg[b], cfg)) { err = "stage " + std::to_string(i + 1) + ": cannot inherit base config"; return false; }
 				st_ref[i] = st_ref[b]; st_manifest[i] = st_manifest[b];
 				st_cfgdigest[i] = st_cfgdigest[b]; st_prov[i] = st_prov[b];
+				st_baseref[i] = st_baseref[b];
 			} else {
 				ImageRef ref = parse_ref(stages[i].base_ref);
 				manifest::Image img;
 				if ( !pull_into(ref, arch_base, arch_var, rfs, cfg, wd, o, img, err)) return false;
 				st_ref[i] = ref; st_manifest[i] = img.manifest_json;
 				st_cfgdigest[i] = img.config_digest; st_prov[i] = img.provenance_digest;
+				st_baseref[i] = stages[i].base_ref;
 			}
 
 			if ( !dockerfile::apply_stage(stages[i], df_ctx, rfs, cfg, built, err)) {
@@ -547,6 +581,7 @@ bool convert(Options& o, std::string& err) {
 		eff_manifest  = st_manifest.back();
 		eff_cfgdigest = st_cfgdigest.back();
 		eff_prov      = st_prov.back();
+		eff_base_ref  = st_baseref.back();
 		logger::info << "==> build complete (" << stages.size()
 		             << ( stages.size() == 1 ? " stage)" : " stages)" ) << std::endl;
 	} else {
@@ -641,17 +676,44 @@ bool convert(Options& o, std::string& err) {
 	logger::info << "==> bundle ready: " << abs_out << std::endl;
 
 	if ( o.do_register ) {
-		// a Dockerfile FROM is the base image, not "the image" - no update provenance
+		// A Dockerfile FROM is the BASE image, not "the image": re-pulling it would
+		// replace the built rootfs with the stock one and silently drop everything
+		// the Dockerfile added. So a build records BUILD provenance instead - the
+		// recipe it came from and the base it was built on - and `uxc upgrade`
+		// re-runs the build rather than a pull. image/digest stay pull-only.
 		std::string prov_image  = df_mode ? std::string() : o.image;
 		std::string prov_digest = df_mode ? std::string() : eff_prov;
+		JSON build = JSON::Object();
+		if ( df_mode ) {
+			build["dockerfile"] = o.dockerfile;
+			if ( !df_ctx.empty()) build["context"] = df_ctx;
+			if ( !o.recipe.empty()) build["recipe"] = o.recipe;
+			// The recipe's fingerprint: an edited Dockerfile is a rebuild available,
+			// even when the base image upstream has not moved at all.
+			std::string herr, dfh = sha256_file(o.dockerfile, herr);
+			if ( !dfh.empty()) build["dockerfile_sha256"] = "sha256:" + dfh;
+			// The final stage's FROM - what a rebuild would pull, and what
+			// check_updates re-resolves to decide whether the base has moved.
+			if ( !eff_base_ref.empty()) build["base"] = eff_base_ref;
+			if ( !eff_prov.empty())     build["base_digest"] = eff_prov;
+			if ( !o.profile.empty())    build["profile"] = o.profile;
+		}
 		// EXPOSE -> web_ports prefill (pull only; a build's EXPOSE is the base image's)
 		JSON web_ports = df_mode ? JSON::Array() : emit::web_ports_from_image(out + "/image-config.json");
 		std::string stop_sig = df_mode ? std::string() : emit::stop_signal_from_image(out + "/image-config.json");
 			// --rw-overlay/--dev: persistent, resettable r/w overlay (base rootfs stays pristine)
 			std::string overlay = ( o.rw_overlay || o.dev ) ? abs_out + ".overlay" : std::string();
 			if ( !overlay.empty()) mkdir(overlay.c_str(), 0700);   // ujail -O needs the dir to exist
-		if ( !reg::register_container(o.uxc_dir, name, abs_out, prov_image, prov_digest, o.infra, o.autostart, web_ports, stop_sig, overlay, err)) { err = "register: " + err; return false; }
+		if ( !reg::register_container(o.uxc_dir, name, abs_out, prov_image, prov_digest, o.infra, o.autostart, web_ports, stop_sig, overlay, build, err)) { err = "register: " + err; return false; }
 		logger::info << "==> registered: " << o.uxc_dir << "/" << name << ".json" << std::endl;
+		// Which recipe produced this container: `uxc deploy --reconcile` re-runs it
+		// after a flash, and LuCI marks the container recipe-managed. A build keeps
+		// it inside `build` too; this covers the pull half.
+		if ( !o.recipe.empty()) {
+			std::string rcerr;
+			if ( !reg::record_recipe(o.uxc_dir, name, o.recipe, rcerr))
+				logger::error << "recipe: " << rcerr << std::endl;      // non-fatal: the bundle is fine
+		}
 		// a profile's "_registry" half: devices, shm_size, volumes, healthcheck,
 		// notes... the things that cannot live in an OCI config but are exactly
 		// what makes an application container actually run
@@ -666,6 +728,13 @@ bool convert(Options& o, std::string& err) {
 				logger::info << "    profile set: " << s << std::endl;
 			}
 		}
+		// host directories the application needs, with the ownership it expects -
+		// created BEFORE the seed files, which are written into them
+		{
+			std::vector<std::string> made = emit::ensure_paths(pinfo.paths);
+			for ( const std::string& p : made )
+				logger::info << "    created host path: " << p << std::endl;
+		}
 		// starting config files the application cannot come up without
 		{
 			std::vector<std::string> seeded = emit::seed_files(pinfo.seed);
@@ -673,10 +742,18 @@ bool convert(Options& o, std::string& err) {
 				logger::info << "    wrote a starting config: " << s << " (edit it before going live)" << std::endl;
 		}
 		if ( !pinfo.needs.empty()) {
-			logger::info << "    the profile needs these host paths to exist before a start:" << std::endl;
+			// _paths just created most of these; only report what is still absent,
+			// so a clean deploy does not print a wall of scary MISSING lines.
+			std::vector<std::string> absent;
 			for ( const std::string& p : pinfo.needs ) {
 				struct stat nst;
-				logger::info << "      " << p << ( stat(p.c_str(), &nst) == 0 ? "" : "   <-- MISSING" ) << std::endl;
+				if ( stat(p.c_str(), &nst) != 0 ) absent.push_back(p);
+			}
+			if ( !absent.empty()) {
+				logger::info << "    these host paths do not exist yet (uxcd creates missing bind sources at start,"
+				             << " but check they are on the partition you meant):" << std::endl;
+				for ( const std::string& p : absent )
+					logger::info << "      " << p << std::endl;
 			}
 		}
 		if ( web_ports.begin() != web_ports.end())

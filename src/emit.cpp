@@ -164,6 +164,24 @@ void collect_info(const JSON& p, const std::string& name, ProfileInfo& info) {
 		info.registry = strip_underscore(p["_registry"]);
 	if ( p.contains("_seed") && p["_seed"].type() == JSON::TYPE::OBJECT )
 		info.seed = p["_seed"];
+	if ( p.contains("_source") && p["_source"].type() == JSON::TYPE::OBJECT )
+		info.source = p["_source"];
+	if ( p.contains("_paths") && p["_paths"].type() == JSON::TYPE::ARRAY ) {
+		const JSON ps = p["_paths"];
+		for ( auto it = ps.begin(); it != ps.end(); ++it ) {
+			JSON e = it.value();
+			PathSpec spec;
+			// a bare string is the common case: "/srv/caddy/data"
+			if ( e.type() == JSON::TYPE::STRING ) spec.path = e.to_string();
+			else if ( e.type() == JSON::TYPE::OBJECT ) {
+				if ( e.contains("path")) spec.path = e["path"].to_string();
+				if ( e.contains("mode")) spec.mode = e["mode"].to_string();
+				if ( e.contains("uid") && e["uid"].type() == JSON::TYPE::INT ) spec.uid = (long long)e["uid"].to_number();
+				if ( e.contains("gid") && e["gid"].type() == JSON::TYPE::INT ) spec.gid = (long long)e["gid"].to_number();
+			}
+			if ( !spec.path.empty() && spec.path[0] == '/' ) info.paths.push_back(spec);
+		}
+	}
 	if ( p.contains("_matches") && p["_matches"].type() == JSON::TYPE::ARRAY ) {
 		const JSON ma = p["_matches"];
 		for ( auto it = ma.begin(); it != ma.end(); ++it ) info.matches.push_back(it.value().to_string());
@@ -294,14 +312,66 @@ std::vector<std::string> seed_files(const JSON& seed) {
 		if ( path.empty() || path[0] != '/' ) continue;      // absolute host paths only
 		struct stat st;
 		if ( stat(path.c_str(), &st) == 0 ) continue;        // never overwrite the user's file
+
+		// The value is the file contents, spelled any of three ways: a string, an
+		// array of lines (far more readable inside JSON than one \n-ridden string),
+		// or { "content": <string|array>, "mode": "0755" } when the seeded file has
+		// to be executable - a cron job or a healthcheck script is useless at 0644.
+		JSON v = it.value();
+		std::string mode;
+		if ( v.type() == JSON::TYPE::OBJECT ) {
+			if ( v.contains("mode")) mode = v["mode"].to_string();
+			v = v.contains("content") ? v["content"] : JSON("");
+		}
+		std::string body;
+		if ( v.type() == JSON::TYPE::ARRAY ) {
+			for ( auto li = v.begin(); li != v.end(); ++li ) body += li.value() -> to_string() + "\n";
+		} else body = v.to_string();
+
 		std::string parent = path.substr(0, path.find_last_of('/'));
 		for ( std::string::size_type i = 1; i <= parent.size(); ++i )   // mkdir -p
 			if ( i == parent.size() || parent[i] == '/' ) mkdir(parent.substr(0, i).c_str(), 0755);
 		std::string werr;
-		if ( write_file(path, it.value().to_string(), werr)) written.push_back(path);
-		else logger::error << "seed: " << werr << std::endl;
+		if ( write_file(path, body, werr)) {
+			if ( !mode.empty()) {
+				long m = strtol(mode.c_str(), nullptr, 8);
+				if ( m > 0 ) chmod(path.c_str(), (mode_t)m);
+			}
+			written.push_back(path);
+		} else logger::error << "seed: " << werr << std::endl;
 	}
 	return written;
+}
+
+std::vector<std::string> ensure_paths(const std::vector<PathSpec>& paths) {
+	std::vector<std::string> created;
+	for ( const PathSpec& p : paths ) {
+		if ( p.path.empty() || p.path[0] != '/' ) continue;
+		struct stat st;
+		bool existed = ( stat(p.path.c_str(), &st) == 0 );
+		if ( !existed ) {
+			for ( std::string::size_type i = 1; i <= p.path.size(); ++i )   // mkdir -p
+				if ( i == p.path.size() || p.path[i] == '/' ) mkdir(p.path.substr(0, i).c_str(), 0755);
+			if ( stat(p.path.c_str(), &st) != 0 ) {
+				logger::error << "paths: cannot create " << p.path << std::endl;
+				continue;
+			}
+			created.push_back(p.path);
+		}
+		// Apply mode/owner whether or not we created it: a redeploy onto a restored
+		// data directory is exactly when the ownership is wrong.
+		if ( !p.mode.empty()) {
+			long m = strtol(p.mode.c_str(), nullptr, 8);
+			if ( m > 0 && chmod(p.path.c_str(), (mode_t)m) != 0 )
+				logger::error << "paths: cannot chmod " << p.path << " to " << p.mode << std::endl;
+		}
+		if ( p.uid >= 0 || p.gid >= 0 ) {
+			if ( chown(p.path.c_str(), p.uid >= 0 ? (uid_t)p.uid : (uid_t)-1,
+			                           p.gid >= 0 ? (gid_t)p.gid : (gid_t)-1 ) != 0 )
+				logger::error << "paths: cannot chown " << p.path << std::endl;
+		}
+	}
+	return created;
 }
 
 std::vector<std::string> profile_names(const std::string& dir) {

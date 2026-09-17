@@ -10,6 +10,17 @@ uxc pull --profile frigate ghcr.io/blakeblackshear/frigate:0.17.2 frigate
 docker2uxc --profile frigate --out /srv/uxc/frigate ghcr.io/blakeblackshear/frigate:0.17.2
 ```
 
+A profile that also carries a **`_source`** block is a **recipe**: it knows where
+its container comes from, so it can deploy itself in one step — image or
+Dockerfile, host directories, config files, registration:
+
+```sh
+uxc recipes                  # the deployable ones (caddy, php-fpm, cron)
+uxc deploy php-fpm           # build + set up everything
+```
+
+See `_source` / `_paths` below, and `docs/recipes.md` in the uxcd tree.
+
 See what an install has, and what each one does:
 
 ```sh
@@ -56,7 +67,26 @@ directives:
 - **`_optional: true`** on a mount — the mount is dropped when its host source
   does not exist, instead of failing the container. One profile can then offer
   `/dev/dri` on boxes that have a GPU without breaking those that do not.
-- **`_registry: { ... }`** — the uxcd-side fields (below).
+- **`_registry: { ... }`** -- the uxcd-side fields (below).
+- **`_seed: { <host path>: <contents> }`** -- starting configuration files,
+  written **only when the file does not exist**, so your edits survive every
+  re-pull and upgrade. `contents` is a string, an array of lines (far more
+  readable inside JSON), or `{ "content": ..., "mode": "0755" }` when the file
+  must be executable (a cron job, a health-check script).
+- **`_paths: [ ... ]`** -- host directories to create before the container
+  starts, as `"/srv/app/data"` or
+  `{ "path": "/srv/app/data", "mode": "0755", "uid": 82, "gid": 82 }`. uxcd
+  creates a missing bind source by itself; what it cannot know is which uid the
+  service inside expects to own it. Mode/owner are re-applied on every deploy
+  (contents are never touched), so a redeploy onto restored data repairs
+  ownership.
+- **`_source: { ... }`** -- makes this profile a **recipe**. Exactly one of:
+  `"image": "<ref>"` (deploy pulls it) or
+  `"build": { "base": "<ref>", "dockerfile": [ "FROM ${base}", ... ] }` (deploy
+  writes that Dockerfile next to the bundle and builds it; `${base}` expands to
+  `base`, which is also the ref the update check follows). Optional `infra` and
+  `autostart` defaults. `"dockerfile_path": "/srv/app/Dockerfile"` reads the body
+  from a hand-maintained file instead.
 - everything else starting with `_` is a comment.
 
 ## What belongs in `_registry`
@@ -88,14 +118,28 @@ profile must not rewrite a container's identity or provenance.
 
 ## Bundled profiles
 
-- **frigate.json** — Frigate NVR: `CAP_SYS_ADMIN` + `CAP_PERFMON`, 1280 MB
+**Recipes** (deployable with `uxc deploy <name>`):
+
+- **caddy.json** -- Caddy web server / reverse proxy: pulls `caddy:2-alpine`,
+  creates `/srv/caddy` with persistent ACME storage, seeds a Caddyfile with a
+  `/healthz` endpoint, registers the binds + an http health check.
+- **php-fpm.json** -- PHP-FPM **built** on `php:8.5-fpm-alpine` with gd/zip/intl/
+  exif compiled in, a webroot owned by 82:82, a pool override and a `:9000`
+  health check. A plain image pull would not have the extensions -- which is why
+  it records build provenance and upgrades by rebuilding.
+- **cron.json** -- scheduled jobs in a container: Alpine + BusyBox `crond` +
+  PHP CLI, crontab/scripts/state binds, an example job and a health-check script.
+
+**Overlay-only profiles** (applied with `uxc pull --profile <name>`):
+
+- **frigate.json** -- Frigate NVR: `CAP_SYS_ADMIN` + `CAP_PERFMON`, 1280 MB
   `/dev/shm`, `/dev/dri` + Coral TPU pass-through, `/config` + `/media`, and an
   HTTP health check on port 5000. See [docs/frigate.md](../../docs/frigate.md).
-- **mosquitto.json** — MQTT broker, config/data binds, TCP check on 1883.
-- **postgres.json** — data bind, sized `/dev/shm`, TCP check on 5432.
-- **mariadb.json** — data bind, sized `/dev/shm`, TCP check on 3306.
-- **icecc.json** — icecream compile node; needs host networking.
-- **_template.json** — annotated boilerplate.
+- **mosquitto.json** -- MQTT broker, config/data binds, TCP check on 1883.
+- **postgres.json** -- data bind, sized `/dev/shm`, TCP check on 5432.
+- **mariadb.json** -- data bind, sized `/dev/shm`, TCP check on 3306.
+- **icecc.json** -- icecream compile node; needs host networking.
+- **_template.json** -- annotated boilerplate.
 
 There is no port mapping in uxc — `ExposedPorts` from the image is
 informational. Containers either share the host network (the default) or get
