@@ -70,12 +70,21 @@ bool register_container(const std::string& uxc_dir, const std::string& name, con
 	// `uxc upgrade` re-pulls the stock image straight over the built rootfs -
 	// exactly how a PHP-FPM container loses its compiled extensions.
 	if ( build.type() == JSON::TYPE::OBJECT && build.begin() != build.end()) {
-		std::string old_bd;
-		if ( merged.contains("build") && merged["build"].type() == JSON::TYPE::OBJECT &&
-		     merged["build"].contains("base_digest"))
-			old_bd = merged["build"]["base_digest"].to_string();
-		std::string new_bd = build.contains("base_digest") ? build["base_digest"].to_string() : "";
-		if ( !new_bd.empty() && !old_bd.empty() && old_bd != new_bd )
+		// "upgraded" for a build: the rootfs is different if EITHER the base image
+		// moved or the recipe itself changed. Comparing only the base would leave
+		// the timestamp empty after the most ordinary rebuild there is - edit the
+		// Dockerfile, upgrade - and the LuCI "Upgraded" row would say nothing
+		// happened.
+		auto old_of = [&merged](const char* key) -> std::string {
+			if ( !merged.contains("build") || merged["build"].type() != JSON::TYPE::OBJECT ) return "";
+			return merged["build"].contains(key) ? merged["build"][key].to_string() : std::string();
+		};
+		auto changed = [&](const char* key) -> bool {
+			std::string o = old_of(key);
+			std::string n = build.contains(key) ? build[key].to_string() : "";
+			return !n.empty() && !o.empty() && o != n;
+		};
+		if ( changed("base_digest") || changed("dockerfile_sha256"))
 			merged["upgraded"] = (long long)time(nullptr);
 		merged["build"] = build;
 		if ( merged.contains("image"))  merged.erase("image");

@@ -51,6 +51,15 @@ std::string after_first_word(const std::string& dl) {
 	std::string::size_type a = dl.find_first_not_of(" \t", ws);
 	return ( a == std::string::npos ) ? "" : dl.substr(a);
 }
+std::string sh_single_quote(const std::string& s) {
+	std::string out = "'";
+	for ( char c : s ) {
+		if ( c == '\'' ) out += "'\\''";
+		else out += c;
+	}
+	out += "'";
+	return out;
+}
 
 // Logical Dockerfile lines: strip CR, drop full-line comments (^\s*#), join
 // backslash continuations, trim, drop empties. Mirrors the shell's grep+awk.
@@ -307,7 +316,26 @@ bool apply_stage(const Stage& stage, const std::string& context_dir,
 	std::string df_wd = "/";
 	if ( cfg.contains("WorkingDir") && cfg["WorkingDir"].type() == JSON::TYPE::STRING && !cfg["WorkingDir"].to_string().empty())
 		df_wd = cfg["WorkingDir"].to_string();
-	std::string df_env;   // accumulated "export K=\"V\"; " prefix applied to each RUN
+	std::string df_env;   // accumulated "export K=V; " prefix applied to each RUN
+
+	// Seed it with the BASE IMAGE's own environment. docker runs every RUN with
+	// the image's ENV in scope, and official images depend on that: php's
+	// docker-php-ext-* helpers live in /usr/local/bin (which is only in the
+	// image's PATH), and $PHPIZE_DEPS names its build dependencies. Without this
+	// `docker-php-ext-install` is "not found" and $PHPIZE_DEPS expands to
+	// nothing - an apk add that silently installs no compiler. Dockerfile ENV
+	// lines append after these, so they still override.
+	if ( cfg.contains("Env") && cfg["Env"].type() == JSON::TYPE::ARRAY ) {
+		const JSON ev = cfg["Env"];
+		for ( auto it = ev.begin(); it != ev.end(); ++it ) {
+			std::string kv = it.value().to_string();
+			std::string::size_type eq = kv.find('=');
+			if ( eq == std::string::npos || eq == 0 ) continue;
+			// single-quoted: these are literal values from the image config, not
+			// something the build should re-expand
+			df_env += "export " + kv.substr(0, eq) + "=" + sh_single_quote(kv.substr(eq + 1)) + "; ";
+		}
+	}
 
 	Mounts mnt(rootfs_dir);   // RAII: unmounts on every return path below
 	if ( !mnt.ok ) { err = mnt.err; return false; }
