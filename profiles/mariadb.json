@@ -3,7 +3,39 @@
 
   "_matches": [ "mariadb", "mysql" ],
 
-  "_comment": "EDIT the data volume path below. Set MARIADB_ROOT_PASSWORD (or MARIADB_ALLOW_EMPTY_ROOT_PASSWORD / MARIADB_RANDOM_ROOT_PASSWORD) in the container's registry 'env' - LuCI: Configure -> Environment - NOT in this file, which is shared by every mariadb container.",
+  "_comment": "A RECIPE: `uxc deploy mariadb` pulls the server, creates /srv/mariadb with the right owner, seeds a 0600 environment file and registers the bind + a TCP health check. The root password is NOT set for you - edit /srv/mariadb/env before the first start. A shared recipe must not ship a database password, and a placeholder people forget to change is worse than a container that refuses to start.",
+
+  "_source": {
+    "_comment_image": "Major-version tag: a MariaDB major upgrade runs mariadb-upgrade against the data dir and is not reversible, so it must never happen unattended. check_updates follows 11 for patch releases.",
+    "image": "mariadb:11"
+  },
+
+  "_comment_paths": "The image runs mysqld as uid/gid 999. Creating the data dir with that owner avoids the first-start chown of every file and makes a restored backup work straight away.",
+  "_paths": [
+    { "path": "/srv/mariadb",      "mode": "0755" },
+    { "path": "/srv/mariadb/data", "mode": "0700", "uid": 999, "gid": 999 }
+  ],
+
+  "_comment_seed": "0600, and read at launch via env_file - so the password lives in one file next to the data instead of in the shared registry entry or in this profile.",
+  "_seed": {
+    "/srv/mariadb/env": {
+      "mode": "0600",
+      "content": [
+        "# Environment for the mariadb container, read by uxcd at launch.",
+        "# EDIT ME: uncomment ONE of the root-password variables, then",
+        "# `uxc start mariadb`. Until you do, the server refuses to initialise",
+        "# and says so in its log (`uxc log mariadb`).",
+        "#",
+        "# MARIADB_ROOT_PASSWORD=",
+        "# MARIADB_RANDOM_ROOT_PASSWORD=1     # generated once, printed in the log",
+        "",
+        "# Optional: an application database and user created on first start.",
+        "# MARIADB_DATABASE=myapp",
+        "# MARIADB_USER=myapp",
+        "# MARIADB_PASSWORD="
+      ]
+    }
+  },
 
   "_comment_caps": "The entrypoint initialises the data dir and then runs mysqld as the 'mysql' user. Listed so the profile also works with --caps minimal.",
   "_caps_add": [ "CAP_CHOWN", "CAP_FOWNER", "CAP_DAC_OVERRIDE", "CAP_SETUID", "CAP_SETGID" ],
@@ -15,8 +47,10 @@
   "_registry": {
     "_comment_shm": "Raise this if you tune the buffer pool high. It is RAM.",
     "shm_size": "128m",
-    "_comment_volumes": "EDIT THIS.",
-    "volumes": [ "/srv/mariadb:/var/lib/mysql" ],
+    "_comment_volumes": "EDIT THIS if /srv is not where your data lives. The data dir is a SUBdirectory of the bind, so the env file next to it never ends up inside the data directory.",
+    "volumes": [ "/srv/mariadb/data:/var/lib/mysql" ],
+    "env_file": [ "/srv/mariadb/env" ],
+    "_comment_health": "Probed inside the container's own network namespace, so 127.0.0.1 is correct both on the host stack and in a shared infra netns.",
     "healthcheck": {
       "checks": [ { "type": "tcp", "target": "127.0.0.1:3306" } ],
       "interval": 30,
@@ -25,6 +59,6 @@
     },
     "respawn": true,
     "urls": [ "https://hub.docker.com/_/mariadb" ],
-    "notes": "First start initialises the data dir and needs a root-password variable in env. The first initialisation can take a minute - that is what start_period covers."
+    "notes": "Deployed from the 'mariadb' recipe. Set a root-password variable in /srv/mariadb/env (0600) BEFORE the first start - without one the server refuses to initialise. Data: /srv/mariadb/data (owned by 999). The first initialisation takes a minute; that is what start_period covers. Back up with mariadb-dump from inside the container: `uxe mariadb mariadb-dump -u root -p --all-databases`; a file-level copy of a running data dir is not a backup."
   }
 }

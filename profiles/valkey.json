@@ -1,0 +1,45 @@
+{
+  "_description": "Valkey (the BSD-licensed Redis fork): an in-memory key/value store for PHP sessions, caches and queues. Persistent snapshots, a memory cap, and a TCP health check on 6379.",
+
+  "_matches": [ "valkey", "redis" ],
+
+  "_comment": "A RECIPE: `uxc deploy valkey` pulls the server, creates /srv/valkey with the right owner and registers the bind + a TCP health check. Pair it with the php-fpm recipe over the same network (host stack, or the same --infra netns) and point the application at 127.0.0.1:6379.",
+
+  "_source": {
+    "_comment_image": "Major-version tag on the alpine variant: small, and a major jump stays a deliberate edit.",
+    "image": "valkey/valkey:8-alpine"
+  },
+
+  "_comment_paths": "The image runs the server as uid/gid 999 and its WORKDIR is /data, where snapshots are written. Creating it with that owner means persistence works on the first start instead of after a permission error in the log.",
+  "_paths": [
+    { "path": "/srv/valkey", "mode": "0755", "uid": 999, "gid": 999 }
+  ],
+
+  "_comment_caps": "The container runs AS the valkey user (see _registry.user), so nothing has to drop privileges at runtime and these are only what the server itself may need. Listed so the recipe also works with --caps minimal.",
+  "_caps_add": [ "CAP_DAC_OVERRIDE", "CAP_SETUID", "CAP_SETGID" ],
+
+  "process": {
+    "env": [ "TZ=UTC" ]
+  },
+
+  "_registry": {
+    "_comment_volumes": "EDIT THIS if /srv is not where your data lives. The image's default save points write snapshots here, so a restart keeps the cache warm.",
+    "volumes": [ "/srv/valkey:/data" ],
+    "_comment_user": "Run as the image's own valkey user (999) from the start. Its entrypoint only chowns /data and re-execs through `setpriv` when it is root - and that setpriv fails under ujail ('keep process capabilities failed', PR_SET_KEEPCAPS is not permitted here). Starting as 999 skips that branch entirely, which is both simpler and less privileged; _paths already creates the data directory with that owner.",
+    "user": "999:999",
+    "_comment_resources": "A cache with no bound will use whatever the box has. This is a hard cgroup ceiling: the kernel OOM-kills the container if it is reached, which is why the server ALSO needs its own maxmemory (below the ceiling) so it evicts instead of dying. Set both, or neither.",
+    "resources": {
+      "memory": { "limit": 268435456 }
+    },
+    "_comment_health": "Probed inside the container's own network namespace, so 127.0.0.1 is correct both on the host stack and in a shared infra netns.",
+    "healthcheck": {
+      "checks": [ { "type": "tcp", "target": "127.0.0.1:6379" } ],
+      "interval": 30,
+      "retries": 3,
+      "start_period": 10
+    },
+    "respawn": true,
+    "urls": [ "https://valkey.io/topics/introduction/" ],
+    "notes": "Deployed from the 'valkey' recipe. Data/snapshots: /srv/valkey (owned by 999). NO AUTHENTICATION and no port mapping: it is reachable only from this box's network namespace - keep it that way, or set a password (`uxe <name> valkey-cli CONFIG SET requirepass <pass>` plus 'requirepass' in a config file) before exposing it. The cgroup memory limit here is 256 MB; give the server a lower maxmemory (e.g. `uxe <name> valkey-cli CONFIG SET maxmemory 200mb` and maxmemory-policy allkeys-lru) so it evicts keys instead of being OOM-killed. For PHP sessions, point session.save_handler at 127.0.0.1:6379."
+  }
+}

@@ -3,7 +3,37 @@
 
   "_matches": [ "postgres", "postgresql" ],
 
-  "_comment": "EDIT the data volume path below. Set POSTGRES_PASSWORD (or POSTGRES_HOST_AUTH_METHOD) in the container's registry 'env' - LuCI: Configure -> Environment - NOT in this file, which is shared by every postgres container.",
+  "_comment": "A RECIPE: `uxc deploy postgres` pulls the server, creates /srv/postgres with the right owner, seeds a 0600 environment file and registers the bind + a TCP health check. The password is NOT set for you - edit /srv/postgres/env and uncomment POSTGRES_PASSWORD before the first start. A shared recipe must not ship a database password, and a placeholder people forget to change is worse than a container that refuses to start.",
+
+  "_source": {
+    "_comment_image": "Major-version tag: a PostgreSQL major upgrade needs pg_upgrade or a dump/restore, so it must never happen unattended. check_updates follows 17 for patch releases; moving to 18 is a deliberate edit of this recipe (and a dump first).",
+    "image": "postgres:17-alpine"
+  },
+
+  "_comment_paths": "The alpine image runs the server as uid/gid 70. Creating the data dir with that owner avoids the first-start chown and makes a restored backup work straight away.",
+  "_paths": [
+    { "path": "/srv/postgres",      "mode": "0700", "uid": 70, "gid": 70 },
+    { "path": "/srv/postgres/data", "mode": "0700", "uid": 70, "gid": 70 }
+  ],
+
+  "_comment_seed": "0600, and read at launch via env_file - so the password lives in one file next to the data instead of in the shared registry entry or in this profile.",
+  "_seed": {
+    "/srv/postgres/env": {
+      "mode": "0600",
+      "content": [
+        "# Environment for the postgres container, read by uxcd at launch.",
+        "# EDIT ME: uncomment and set a password, then `uxc start postgres`.",
+        "# Until you do, the server refuses to initialise and says so in its log",
+        "# (`uxc log postgres`) - which is the safe failure for a database.",
+        "#",
+        "# POSTGRES_PASSWORD=",
+        "",
+        "# Optional: the database and role created on first start (default: postgres).",
+        "# POSTGRES_USER=myapp",
+        "# POSTGRES_DB=myapp"
+      ]
+    }
+  },
 
   "_comment_caps": "The entrypoint initialises the data dir and then runs the server as the 'postgres' user. Listed so the profile also works with --caps minimal.",
   "_caps_add": [ "CAP_CHOWN", "CAP_FOWNER", "CAP_DAC_OVERRIDE", "CAP_SETUID", "CAP_SETGID" ],
@@ -15,8 +45,10 @@
   "_registry": {
     "_comment_shm": "Postgres uses shared memory for parallel query workers; raise this for many connections or a large work_mem. It is RAM.",
     "shm_size": "256m",
-    "_comment_volumes": "EDIT THIS.",
-    "volumes": [ "/srv/postgres:/var/lib/postgresql/data" ],
+    "_comment_volumes": "EDIT THIS if /srv is not where your data lives. The data dir is a SUBdirectory of the bind, so the env file next to it never ends up inside PGDATA.",
+    "volumes": [ "/srv/postgres/data:/var/lib/postgresql/data" ],
+    "env_file": [ "/srv/postgres/env" ],
+    "_comment_health": "Probed inside the container's own network namespace, so 127.0.0.1 is correct both on the host stack and in a shared infra netns.",
     "healthcheck": {
       "checks": [ { "type": "tcp", "target": "127.0.0.1:5432" } ],
       "interval": 30,
@@ -25,6 +57,6 @@
     },
     "respawn": true,
     "urls": [ "https://hub.docker.com/_/postgres" ],
-    "notes": "First start initialises the data dir and needs POSTGRES_PASSWORD in env. Back up with pg_dump from inside the container (uxe postgres)."
+    "notes": "Deployed from the 'postgres' recipe. Set POSTGRES_PASSWORD in /srv/postgres/env (0600) BEFORE the first start - without it the server refuses to initialise. Data: /srv/postgres/data (owned by 70). Back up with pg_dump from inside the container: `uxe postgres pg_dump -U postgres <db>`; a file-level copy of a running data dir is not a backup. The image tag is pinned to a major version: a major upgrade needs a dump and restore, never a plain image pull."
   }
 }

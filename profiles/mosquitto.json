@@ -3,7 +3,19 @@
 
   "_matches": [ "eclipse-mosquitto", "mosquitto" ],
 
-  "_comment": "EDIT the two volume paths below. Put a mosquitto.conf in the config dir before the first start - without one the broker only listens on localhost. Add 'persistence true' + 'persistence_location /mosquitto/data/' to keep retained messages.",
+  "_comment": "A RECIPE: `uxc deploy mosquitto mqtt` pulls the broker, creates /srv/mosquitto, writes a starting mosquitto.conf and registers the binds + a TCP health check. The seeded config is CLOSED (allow_anonymous false): add a password file or open it deliberately before clients can connect.",
+
+  "_source": {
+    "_comment_image": "Major-version tag: 2.x refuses to start without a config file and changed the anonymous default, so an unattended jump to 3.x is not something a deploy should do for you.",
+    "image": "eclipse-mosquitto:2"
+  },
+
+  "_comment_paths": "The image runs the broker as uid/gid 1883 after its entrypoint chowns /mosquitto. Creating the data dir with that owner up front means persistence works on the first start instead of after a confusing permission error.",
+  "_paths": [
+    { "path": "/srv/mosquitto",        "mode": "0755" },
+    { "path": "/srv/mosquitto/config", "mode": "0755" },
+    { "path": "/srv/mosquitto/data",   "mode": "0755", "uid": 1883, "gid": 1883 }
+  ],
 
   "_comment_caps": "The entrypoint chowns /mosquitto and then re-executes the broker as the unprivileged 'mosquitto' user, which needs CAP_CHOWN + CAP_SETUID/CAP_SETGID + CAP_DAC_OVERRIDE. Those are in the default (permissive) set; listing them here keeps the profile working with --caps minimal too.",
   "_caps_add": [ "CAP_CHOWN", "CAP_FOWNER", "CAP_DAC_OVERRIDE", "CAP_SETUID", "CAP_SETGID" ],
@@ -19,11 +31,12 @@
     "/srv/mosquitto/config/mosquitto.conf": "# Written by the uxcd 'mosquitto' profile. Edit freely - it is never overwritten.\n\nlistener 1883\n\n# Closed by default. Pick ONE:\n#   1) create a password file and point at it:\n#        uxe mqtt mosquitto_passwd -c -b /mosquitto/config/passwd <user> <password>\n#        password_file /mosquitto/config/passwd\n#   2) or, on a trusted LAN only:\n#        allow_anonymous true\nallow_anonymous false\n\npersistence true\npersistence_location /mosquitto/data/\n\nlog_dest stdout\n"
   },
   "_registry": {
-    "_comment_volumes": "EDIT THESE.",
+    "_comment_volumes": "EDIT THESE if /srv is not where your data lives.",
     "volumes": [
       "/srv/mosquitto/config:/mosquitto/config",
       "/srv/mosquitto/data:/mosquitto/data"
     ],
+    "_comment_health": "Probed inside the container's own network namespace, so 127.0.0.1 is correct both on the host stack and in a shared infra netns.",
     "healthcheck": {
       "checks": [ { "type": "tcp", "target": "127.0.0.1:1883" } ],
       "interval": 30,
@@ -32,6 +45,6 @@
     },
     "respawn": true,
     "urls": [ "https://mosquitto.org/man/mosquitto-conf-5.html" ],
-    "notes": "Broker config: /mosquitto/config/mosquitto.conf. Anonymous access is off by default in 2.x - add a listener and either 'allow_anonymous true' or a password file."
+    "notes": "Deployed from the 'mosquitto' recipe. Broker config: /srv/mosquitto/config/mosquitto.conf (edit, then `uxc restart <name>`). Anonymous access is OFF: add a password file (uxe <name> mosquitto_passwd -c -b /mosquitto/config/passwd <user> <pass>, then 'password_file /mosquitto/config/passwd') or, on a trusted LAN only, 'allow_anonymous true'. Retained messages and the persistence DB live in /srv/mosquitto/data (owned by 1883). uxcd does no port mapping - reach it over a shared infra netns, or route to it with your own firewall rule."
   }
 }
