@@ -94,11 +94,17 @@
       "/srv/caddy/storage:/var/storage",
       "/srv/htdocs:/var/htdocs/www:ro"
     ],
+    "_comment_env": "HOME: Caddy warns '$HOME environment variable is empty' and falls back to ./caddy for stray assets - the image sets XDG_* but no HOME. Pointed at /config, which is already a persistent volume, so nothing new has to be mounted (and an existing container picks it up by adding just this key). GOMAXPROCS bounds the Go runtime: with no CPU quota it sizes itself to every core on the box ('maxprocs: Leaving GOMAXPROCS=8: CPU quota undefined' in the log), which is more scheduler threads than a web server here needs. Raise it for a busy site, or set resources.cpu instead and drop it.",
+    "env": [
+      "HOME=/config",
+      "GOMAXPROCS=2"
+    ],
     "respawn": true,
     "web_ports": [
       { "port": 443, "scheme": "https" },
       { "port": 80 }
     ],
+    "_comment_health": "Checked on the container's own 127.0.0.1 - uxcd runs tcp/http probes inside the container's network namespace - so this works the same on the host stack and in an infra netns. It needs the :80 /healthz block in the Caddyfile.",
     "healthcheck": {
       "interval": 30,
       "retries": 3,
