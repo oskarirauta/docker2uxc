@@ -1,0 +1,46 @@
+{
+  "_description": "Gitea: a self-hosted Git service with a web UI, issues and pull requests. Alpine-based official image, everything under one data directory.",
+
+  "_matches": [ "gitea", "forgejo" ],
+
+  "_comment": "A RECIPE: `uxc deploy gitea` pulls the server, creates /srv/gitea with the right owner and registers the bind + a health check. The first start runs Gitea's own web installer, which writes /srv/gitea/data/gitea/conf/app.ini - so there is nothing to seed here, and no config file for a redeploy to argue with. Reach the installer at port 3000 (see _comment_ports below if the container is in an infra netns).",
+
+  "_source": {
+    "_comment_image": "The official image, which is Alpine-based already - no third-party repack needed. Major-version tag: Gitea's minor releases migrate the database on first start, which is fine and automatic, but a major jump is a decision.",
+    "image": "gitea/gitea:1"
+  },
+
+  "_comment_paths": "The image runs as uid/gid 1000 (git). One directory holds everything: repositories, the database, avatars, LFS and the generated app.ini. That single path is the backup unit.",
+  "_paths": [
+    { "path": "/srv/gitea",      "mode": "0755" },
+    { "path": "/srv/gitea/data", "mode": "0750", "uid": 1000, "gid": 1000 }
+  ],
+
+  "_comment_caps": "The entrypoint fixes ownership under /data and drops to the git user via su-exec. Listed so the recipe also works with --caps minimal.",
+  "_caps_add": [ "CAP_CHOWN", "CAP_FOWNER", "CAP_DAC_OVERRIDE", "CAP_SETUID", "CAP_SETGID" ],
+
+  "_registry": {
+    "_comment_volumes": "EDIT THIS if /srv is not where your data lives. /data is everything Gitea keeps - back it up, together with a database dump if you move it off SQLite.",
+    "volumes": [ "/srv/gitea/data:/data" ],
+    "_comment_env": "USER_UID/USER_GID must match the owner of the data directory above. ROOT_URL is what Gitea writes into clone links and e-mails: set it to the address users actually reach, or every clone URL will point at the container. TZ affects issue timestamps.",
+    "env": [
+      "USER_UID=1000",
+      "USER_GID=1000",
+      "TZ=UTC"
+    ],
+    "_comment_ports": "In an infra netns the web UI is not reachable from the LAN. Publish it by adding ports, e.g. \"ports\": [ \"3000:3000\" ] (and \"2222:22\" for git-over-SSH), then set GITEA__server__ROOT_URL and GITEA__server__SSH_PORT to match. See docs/networking.md - a published port is a userspace proxy, so Gitea logs the forwarder as the client; use an fw4 redirect if that matters to you.",
+    "_comment_health": "Gitea's own endpoint, probed inside the container's network namespace - correct on the host stack and in an infra netns alike. start_period covers the first start, which initialises the database.",
+    "healthcheck": {
+      "checks": [ { "type": "http", "target": "127.0.0.1:3000/api/healthz" } ],
+      "interval": 30,
+      "retries": 3,
+      "start_period": 60
+    },
+    "respawn": true,
+    "web_ports": [
+      { "port": 3000, "label": "Gitea" }
+    ],
+    "urls": [ "https://docs.gitea.com/administration/config-cheat-sheet" ],
+    "notes": "Deployed from the 'gitea' recipe. Everything lives in /srv/gitea/data (owned by 1000): repositories, the SQLite database, LFS, and the app.ini that Gitea's installer writes on first start - that directory IS the backup. Finish the setup in the browser on port 3000; set the server's ROOT_URL to the address users reach, or clone links will point at the container. Git over SSH needs port 22 published or a reverse proxy; the web UI alone is fine behind Caddy. Gitea migrates its database automatically on a minor upgrade, so `uxc upgrade` is safe - but take a copy of /srv/gitea/data first anyway."
+  }
+}

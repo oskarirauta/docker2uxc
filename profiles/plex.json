@@ -1,0 +1,48 @@
+{
+  "_description": "Plex Media Server: hardware transcoding through /dev/dri, a persistent config directory and a TCP health check on 32400. Works with the official image or a slimmer community rebuild.",
+
+  "_comment_matches": "Matches the official image and the common community rebuilds, so a pull of any of them is told this profile exists.",
+  "_matches": [ "plexinc/pms-docker", "plex-media-server", "alpine-plex", "plex" ],
+
+  "_comment": "A PROFILE, not a recipe - deliberately. Which image you run is a real choice (see _comment_image), your media lives wherever your disks are, and the first start needs a claim token that is valid for four minutes. A recipe would have to guess all three. This carries the part that is genuinely hard to get right instead:\n\n  uxc pull --profile plex <image> plex\n\nthen edit the volumes in /etc/uxc/plex.json and set PLEX_CLAIM before the first start.",
+
+  "_comment_image": "Pick one; uxcd tracks whatever you pull and upgrades that:\n  plexinc/pms-docker:latest  - official, Ubuntu-based (~400 MB). There is also a 'plexpass' tag carrying beta builds, which needs a Plex Pass account.\n  spritsail/plex-media-server, forumi0721/alpine-plex - community Alpine rebuilds (~100-120 MB). Smaller, and next to a single film the difference is noise; the trade-off is a single-maintainer repack of proprietary software, so check when it was last updated before relying on it. Plex Pass FEATURES (hardware transcoding, offline sync) are tied to the signed-in account, not the image - a community build serves a Plex Pass user fine, it just tracks public releases rather than the beta channel.",
+
+  "_comment_caps": "The entrypoints chown the config tree and drop to an unprivileged user. Listed so the profile also works with --caps minimal.",
+  "_caps_add": [ "CAP_CHOWN", "CAP_FOWNER", "CAP_DAC_OVERRIDE", "CAP_SETUID", "CAP_SETGID" ],
+
+  "_comment_mounts": "Transcoding writes large temporary files. The default tmpfs is unbounded and it is RAM - bound it, or point /transcode at a disk volume in _registry below instead.",
+  "mounts": [
+    { "destination": "/transcode", "type": "tmpfs", "source": "tmpfs",
+      "options": [ "nosuid", "nodev", "mode=1777", "size=4g" ] }
+  ],
+
+  "_registry": {
+    "_comment_devices": "The iGPU, for hardware transcoding (a Plex Pass feature). Passed through as a directory so re-enumeration keeps working, and skipped automatically on a box without one. Software transcoding needs no device at all.",
+    "devices": [ "/dev/dri" ],
+    "_comment_volumes": "EDIT THESE. The config directory is the irreplaceable one: it holds the library database, watch state and metadata. Media is mounted read-only - Plex never needs to write to it, and a library scan cannot then damage the originals.",
+    "volumes": [
+      "/srv/plex/config:/config",
+      "/srv/media:/media:ro"
+    ],
+    "_comment_env": "PLEX_CLAIM links the server to your account on FIRST start and expires in four minutes - get a fresh one from https://plex.tv/claim right before starting, then remove it. ADVERTISE_IP must be the address clients actually reach, which in an infra netns is the PUBLISHED host address, not the container's.",
+    "env": [
+      "TZ=UTC",
+      "PLEX_UID=1000",
+      "PLEX_GID=1000"
+    ],
+    "_comment_ports": "Plex speaks on 32400. On the host stack it is already reachable; in an infra netns publish it - \"ports\": [ \"32400:32400\" ] - and set ADVERTISE_IP to http://<host-ip>:32400/. Note that a published port is a userspace proxy, so Plex sees the forwarder as the client: its 'allowed networks' / LAN detection will treat every client as remote. For Plex specifically an fw4 redirect is usually the better answer; see docs/networking.md.",
+    "healthcheck": {
+      "checks": [ { "type": "tcp", "target": "127.0.0.1:32400" } ],
+      "interval": 30,
+      "retries": 3,
+      "start_period": 60
+    },
+    "respawn": true,
+    "web_ports": [
+      { "port": 32400, "label": "Plex", "path": "/web" }
+    ],
+    "urls": [ "https://support.plex.tv/articles/200288586-installation/" ],
+    "notes": "Set PLEX_CLAIM from https://plex.tv/claim (valid four minutes) before the FIRST start, then drop it. /srv/plex/config is the backup unit - the library database and watch state live there; media can be re-scanned, that cannot. Media is mounted read-only on purpose. Hardware transcoding needs /dev/dri and a Plex Pass account. In an infra netns, set ADVERTISE_IP to the published host address or clients will be handed an address they cannot reach, and remember that a published port makes every client look remote to Plex's LAN detection."
+  }
+}
